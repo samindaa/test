@@ -30,8 +30,7 @@ Action-space conventions:
 
 from __future__ import annotations
 
-import argparse
-import sys
+from absl import app, flags
 
 import gymnasium as gym
 import numpy as np
@@ -131,12 +130,14 @@ ENV_PRESETS: dict[str, dict] = {
     },
     "Reacher-v5": {
         "num_learning_iterations": 1000,
-        "num_envs": 32,
-        "num_steps_per_env": 50,  # matches max_episode_length=50
+        "num_envs": 128,  # more parallel targets → diverse rollouts
+        "num_steps_per_env":
+        24,  # short rollout horizon; update ~twice per episode
+        # total samples/iter: 64 × 24 = 1,536
         "fsq_levels": [8, 8, 8, 8],  # obs(10) → dim=4 bottleneck, 4096 codes
         "encoder_hidden_dims": [128, 64],
         "decoder_hidden_dims": [64],
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-3,
         "entropy_coef": 0.01,
     },
 }
@@ -407,7 +408,7 @@ def make_fsq_ppo_cfg(preset: dict) -> dict:
         },
         "algorithm": {
             "class_name": "PPO",
-            "num_learning_epochs": 4,
+            "num_learning_epochs": 5,
             "num_mini_batches": 4,
             "clip_param": 0.2,
             "gamma": 0.99,
@@ -416,6 +417,7 @@ def make_fsq_ppo_cfg(preset: dict) -> dict:
             "entropy_coef": preset["entropy_coef"],
             "schedule": "adaptive",
             "desired_kl": 0.01,
+            "max_grad_norm": 1.0,
         },
         "actor": {
             "class_name": FSQMLPModel,
@@ -474,43 +476,32 @@ def evaluate(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Main
+# 5.  Flags + Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+FLAGS = flags.FLAGS
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Classic Control: PPO with FSQ actor")
-    parser.add_argument(
-        "--env",
-        default="CartPole-v1",
-        choices=list(ENV_PRESETS),
-        help="Gymnasium environment ID",
-    )
-    parser.add_argument("--iters",
-                        type=int,
-                        default=None,
-                        help="Override num learning iterations")
-    parser.add_argument("--num-envs",
-                        type=int,
-                        default=None,
-                        help="Override number of parallel envs")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+flags.DEFINE_enum("env", "CartPole-v1", list(ENV_PRESETS),
+                  "Gymnasium environment ID")
+flags.DEFINE_integer("iters", None, "Override num learning iterations")
+flags.DEFINE_integer("num_envs", None, "Override number of parallel envs")
+flags.DEFINE_integer("seed", 42, "Random seed")
 
+
+def main(_) -> None:
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    torch.manual_seed(args.seed)
-    print(f"Environment : {args.env}")
+    torch.manual_seed(FLAGS.seed)
+    print(f"Environment : {FLAGS.env}")
     print(f"Device      : {device}")
 
-    preset = dict(ENV_PRESETS[args.env])  # copy so we can override safely
-    if args.iters is not None:
-        preset["num_learning_iterations"] = args.iters
-    if args.num_envs is not None:
-        preset["num_envs"] = args.num_envs
+    preset = dict(ENV_PRESETS[FLAGS.env])  # copy so we can override safely
+    if FLAGS.iters is not None:
+        preset["num_learning_iterations"] = FLAGS.iters
+    if FLAGS.num_envs is not None:
+        preset["num_envs"] = FLAGS.num_envs
 
     env_kwargs = preset.get("env_kwargs", {})
-    env = ClassicControlVecEnv(args.env,
+    env = ClassicControlVecEnv(FLAGS.env,
                                num_envs=preset["num_envs"],
                                device=device,
                                env_kwargs=env_kwargs)
@@ -521,7 +512,7 @@ def main() -> None:
     runner = OnPolicyRunner(
         env,
         make_fsq_ppo_cfg(preset),
-        log_dir=f"/tmp/rsl_rl_fsq_{args.env.replace('-', '_').lower()}",
+        log_dir=f"/tmp/rsl_rl_fsq_{FLAGS.env.replace('-', '_').lower()}",
         device=device,
     )
 
@@ -530,7 +521,7 @@ def main() -> None:
     print(f"FSQ latent dim    : {actor.fsq.dim}")
     print(f"\n{'='*60}")
     print(
-        f"Training PPO+FSQ on {args.env} for {preset['num_learning_iterations']} iterations …"
+        f"Training PPO+FSQ on {FLAGS.env} for {preset['num_learning_iterations']} iterations …"
     )
     print("=" * 60)
 
@@ -538,7 +529,7 @@ def main() -> None:
 
     policy = runner.get_inference_policy(device=device)
     mean_reward = evaluate(policy,
-                           args.env,
+                           FLAGS.env,
                            num_envs=preset["num_envs"],
                            device=device,
                            env_kwargs=env_kwargs)
@@ -548,4 +539,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    app.run(main)
