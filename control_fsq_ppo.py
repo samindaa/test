@@ -1,13 +1,20 @@
 """
 Classic Control: PPO with FSQ bottleneck actor
 ===============================================
-Run with:
-    python control_fsq_ppo.py
-    python control_fsq_ppo.py --env Pendulum-v1
-    python control_fsq_ppo.py --env MountainCarContinuous-v0 --iters 500
-    python control_fsq_ppo.py --env Acrobot-v1 --num-envs 32
-    python control_fsq_ppo.py --env InvertedPendulum-v5
-    python control_fsq_ppo.py --env InvertedDoublePendulum-v5
+Setup:
+    uv sync
+
+Run with uv:
+    uv run train --env=CartPole-v1
+    uv run train --env=Pendulum-v1
+    uv run train --env=MountainCarContinuous-v0 --iters=500
+    uv run train --env=Acrobot-v1 --num_envs=32
+    uv run train --env=InvertedPendulum-v5
+    uv run train --env=InvertedDoublePendulum-v5
+    uv run train --env=Reacher-v5 --iters=1000 --num_envs=128
+
+Or directly:
+    python control_fsq_ppo.py --env=CartPole-v1
 
 Supported environments:
     CartPole-v1                 discrete(2),  obs(4)
@@ -538,5 +545,9 @@ def main(_) -> None:
     env._envs.close()
 
 
-if __name__ == "__main__":
+def app_run():
     app.run(main)
+
+
+if __name__ == "__main__":
+    app_run()

@@ -1,0 +1,35 @@
+[project]
+name = "fsq-control"
+version = "0.1.0"
+description = "PPO with FSQ bottleneck actor for Gymnasium control environments"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.11.0",
+    "gymnasium[mujoco]>=1.2.3",
+    "tensordict>=0.11.0",
+    "numpy>=2.4.3",
+    "absl-py>=2.4.0",
+    "imageio>=2.37.3",
+    "rsl-rl-lib==5.0.1",
+    "tensorboard>=2.19.0",
+]
+
+[project.scripts]
+train = "control_fsq_ppo:app_run"
+play  = "play:app_run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.uv]
+dev-dependencies = []
+
+[tool.uv.sources]
+rsl-rl-lib = { path = "/Users/saminda/Projects/rsl_rl" }

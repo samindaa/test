@@ -1,11 +1,19 @@
 """
 Play a trained FSQ policy in a MuJoCo viewer.
 
-Usage:
-    python play.py                                        # latest Reacher-v5 checkpoint
-    python play.py --env InvertedPendulum-v5
-    python play.py --env Reacher-v5 --checkpoint /tmp/rsl_rl_fsq_reacher_v5/model_500.pt
-    python play.py --env Reacher-v5 --episodes 5
+Setup:
+    uv sync
+
+Run with uv:
+    uv run play                                                             # latest Reacher-v5 checkpoint
+    uv run play --env=InvertedPendulum-v5
+    uv run play --env=Reacher-v5 --episodes=5
+    uv run play --env=Reacher-v5 --checkpoint=/tmp/rsl_rl_fsq_reacher_v5/model_999.pt
+
+Or directly:
+    python play.py --env=Reacher-v5
+
+Note: MuJoCo envs render natively on Mac. Classic control envs (CartPole etc.) require pygame.
 """
 
 from __future__ import annotations
@@ -106,5 +114,9 @@ def main(_) -> None:
     play(FLAGS.env, policy, FLAGS.episodes, device, env_kwargs)
 
 
-if __name__ == "__main__":
+def app_run():
     app.run(main)
+
+
+if __name__ == "__main__":
+    app_run()
