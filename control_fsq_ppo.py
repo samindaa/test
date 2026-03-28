@@ -39,8 +39,6 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-sys.path.insert(0, "/Users/saminda/Projects/rsl_rl")
-
 from rsl_rl.env import VecEnv
 from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.modules import MLP, EmpiricalNormalization
@@ -114,24 +112,28 @@ ENV_PRESETS: dict[str, dict] = {
         "decoder_hidden_dims": [64],
         "learning_rate": 3e-4,
         "entropy_coef": 0.01,
-        "env_kwargs": {"reset_noise_scale": 0.1},
+        "env_kwargs": {
+            "reset_noise_scale": 0.1
+        },
     },
     "InvertedDoublePendulum-v5": {
         "num_learning_iterations": 500,
         "num_envs": 16,
         "num_steps_per_env": 64,
-        "fsq_levels": [8, 8, 8, 8],   # obs(9) → dim=4 bottleneck, 4096 codes
+        "fsq_levels": [8, 8, 8, 8],  # obs(9) → dim=4 bottleneck, 4096 codes
         "encoder_hidden_dims": [128, 64],
         "decoder_hidden_dims": [64],
         "learning_rate": 3e-4,
         "entropy_coef": 0.01,
-        "env_kwargs": {"healthy_reward": 10},
+        "env_kwargs": {
+            "healthy_reward": 10
+        },
     },
     "Reacher-v5": {
         "num_learning_iterations": 1000,
         "num_envs": 32,
-        "num_steps_per_env": 50,       # matches max_episode_length=50
-        "fsq_levels": [8, 8, 8, 8],   # obs(10) → dim=4 bottleneck, 4096 codes
+        "num_steps_per_env": 50,  # matches max_episode_length=50
+        "fsq_levels": [8, 8, 8, 8],  # obs(10) → dim=4 bottleneck, 4096 codes
         "encoder_hidden_dims": [128, 64],
         "decoder_hidden_dims": [64],
         "learning_rate": 3e-4,
