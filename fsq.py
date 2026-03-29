@@ -14,12 +14,22 @@ class FSQ(nn.Module):
     """
     Finite Scalar Quantization module.
 
-    Each dimension of the latent is quantized to a fixed set of levels.
-    Total codebook size = product of all levels.
+    Each dimension of the latent is independently quantized to L discrete levels.
+    Total codebook size = product of all levels.  No learned parameters; gradients
+    flow via the Straight-Through Estimator (STE).
+
+    Implementation follows the reference code from Appendix A.1 of the paper:
+        z_i  →  bound(z_i)  →  round (STE)  →  normalize to [-1, 1]
 
     Args:
-        levels: List of integers, number of quantization levels per dimension.
-                E.g. [8, 5, 5, 5] gives 8*5*5*5 = 1000 codes.
+        levels: Number of quantization levels per dimension.
+                Recommended configs from paper (Appendix A.4.1):
+                  [8, 5, 5, 5, 5]  →  5_000 codes
+                  [8, 8, 8, 5]     →  2_560 codes
+                  [8, 8, 8, 8]     →  4_096 codes
+                  [8, 8, 8]        →   512 codes
+                  [8, 5, 5, 5]     →  1_000 codes
+                  [5, 5, 5, 5, 5]  →  3_125 codes
     """
 
     def __init__(self, levels: List[int]):
@@ -27,81 +37,89 @@ class FSQ(nn.Module):
         self.levels = levels
         self.dim = len(levels)
 
-        # Precompute level tensors as buffers (not learned parameters)
-        levels_tensor = torch.tensor(levels, dtype=torch.float32)
-        self.register_buffer("levels_tensor", levels_tensor)
+        _levels = torch.tensor(levels, dtype=torch.int32)
+        self.register_buffer("_levels", _levels)
 
-        # Implicit codebook size
-        self.codebook_size = 1
+        _basis = torch.cumprod(torch.tensor([1] + levels[:-1], dtype=torch.int32), dim=0)
+        self.register_buffer("_basis", _basis)
+
+        self.codebook_size: int = 1
         for l in levels:
             self.codebook_size *= l
 
-        # Basis for converting multi-dim indices to flat code indices
-        basis = torch.cumprod(torch.tensor([1] + levels[:-1]), dim=0)
-        self.register_buffer("basis", basis)
+    # ------------------------------------------------------------------
+    # Straight-through helpers
+    # ------------------------------------------------------------------
 
-    def bound(self, z: Tensor) -> Tensor:
-        """Bound z to the range expected before rounding to quantization levels."""
-        half_l = (self.levels_tensor - 1) / 2  # e.g. for 5 levels: [-2, -1, 0, 1, 2]
-        # Shift so levels are symmetric around 0
-        offset = torch.where(
-            self.levels_tensor % 2 == 0,
-            torch.tensor(0.5, device=z.device),
-            torch.tensor(0.0, device=z.device),
-        )
+    @staticmethod
+    def _round_ste(z: Tensor) -> Tensor:
+        return z + (z.round() - z).detach()
+
+    # ------------------------------------------------------------------
+    # Bound + quantize  (matches Appendix A.1 reference)
+    # ------------------------------------------------------------------
+
+    def bound(self, z: Tensor, eps: float = 1e-3) -> Tensor:
+        """Bound z and quantize to discrete levels; output is normalized to [-1, 1].
+
+        For odd L:   values in {-(L-1)/2, …, (L-1)/2} / (L//2)
+        For even L:  shifted so levels are symmetric, then normalized.
+        """
+        half_l = (self._levels - 1).float() * (1 + eps) / 2   # eps prevents tanh saturation
+        offset = torch.where(self._levels % 2 == 0,
+                             torch.full_like(half_l, 0.5),
+                             torch.zeros_like(half_l))
         shift = (offset / half_l).atanh()
-        return (z + shift).tanh() * half_l - offset
+        bounded_z = (z + shift).tanh() * half_l - offset       # integer-valued range
+        half_width = (self._levels // 2).float()
+        return self._round_ste(bounded_z) / half_width          # normalized to [-1, 1]
 
     def quantize(self, z: Tensor) -> Tensor:
-        """Quantize z to nearest level values (straight-through in backward pass)."""
-        bounded = self.bound(z)
-        # Round to nearest integer level — straight-through estimator
-        quantized = bounded + (bounded.round() - bounded).detach()
-        return quantized
+        """Bound + round + normalize, with STE gradient."""
+        return self.bound(z)
+
+    # ------------------------------------------------------------------
+    # Index conversion  (works on normalized [-1, 1] codes)
+    # ------------------------------------------------------------------
+
+    def _scale_and_shift(self, codes_normalized: Tensor) -> Tensor:
+        """Normalized [-1, 1]  →  integer [0, L-1]."""
+        half_width = (self._levels // 2).float()
+        return codes_normalized * half_width + half_width
+
+    def _scale_and_shift_inverse(self, integer_codes: Tensor) -> Tensor:
+        """Integer [0, L-1]  →  normalized [-1, 1]."""
+        half_width = (self._levels // 2).float()
+        return (integer_codes - half_width) / half_width
 
     def codes_to_indices(self, codes: Tensor) -> Tensor:
-        """
-        Convert quantized codes (floating point level values) to flat integer indices.
-
-        Args:
-            codes: Tensor of shape (..., dim) with quantized level values.
-        Returns:
-            indices: Tensor of shape (...,) with flat integer code indices.
-        """
-        half_l = (self.levels_tensor - 1) // 2
-        # Shift from [-half_l, half_l] to [0, levels-1]
-        integer_codes = (codes + half_l).long()
-        return (integer_codes * self.basis).sum(dim=-1)
+        """Normalized codes (..., dim) → flat codebook indices (...)."""
+        assert codes.shape[-1] == self.dim
+        integer_codes = self._scale_and_shift(codes).long()
+        return (integer_codes * self._basis).sum(dim=-1)
 
     def indices_to_codes(self, indices: Tensor) -> Tensor:
-        """
-        Convert flat integer indices back to quantized code values.
-
-        Args:
-            indices: Tensor of shape (...,) with flat integer code indices.
-        Returns:
-            codes: Tensor of shape (..., dim) with quantized level values.
-        """
-        levels = self.levels_tensor.long()
-        half_l = (levels - 1) // 2
+        """Flat codebook indices (...) → normalized codes (..., dim)."""
         integer_codes = torch.stack(
-            [(indices // self.basis[i]) % levels[i] for i in range(self.dim)],
+            [(indices // self._basis[i]) % self._levels[i] for i in range(self.dim)],
             dim=-1,
-        )
-        return (integer_codes - half_l).float()
+        ).float()
+        return self._scale_and_shift_inverse(integer_codes)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(self, z: Tensor) -> Tuple[Tensor, Tensor]:
         """
-        Forward pass.
-
         Args:
-            z: Input tensor of shape (..., dim). Last dim must match len(levels).
+            z: (..., dim)  — last dim must equal len(levels).
         Returns:
-            quantized: Same shape as z, quantized values (straight-through gradients).
-            indices: Flat codebook indices of shape (...,).
+            quantized: same shape as z, normalized to [-1, 1], STE gradients.
+            indices:   (...,) flat codebook indices.
         """
         assert z.shape[-1] == self.dim, (
-            f"Input last dim {z.shape[-1]} must match number of levels {self.dim}"
+            f"Input last dim {z.shape[-1]} must match FSQ dim {self.dim}"
         )
         quantized = self.quantize(z)
         indices = self.codes_to_indices(quantized)

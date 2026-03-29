@@ -9,6 +9,8 @@ Run with uv:
     uv run play --env=InvertedPendulum-v5
     uv run play --env=Reacher-v5 --episodes=5
     uv run play --env=Reacher-v5 --checkpoint=/tmp/rsl_rl_fsq_reacher_v5/model_999.pt
+    uv run play --env=Pusher-v5
+    uv run play --env=Hopper-v5
 
 Or directly:
     python play.py --env=Reacher-v5
@@ -39,10 +41,11 @@ flags.DEFINE_integer("episodes", 10, "Number of episodes to play")
 
 
 def latest_checkpoint(env_id: str) -> str:
-    log_dir = f"/tmp/rsl_rl_fsq_{env_id.replace('-', '_').lower()}"
-    pts = glob.glob(os.path.join(log_dir, "model_*.pt"))
+    env_prefix = env_id.replace("-", "_").lower()
+    pts = glob.glob(f"/tmp/rsl_rl_{env_prefix}_*/model_*.pt")
     if not pts:
-        raise FileNotFoundError(f"No checkpoints found in {log_dir}")
+        raise FileNotFoundError(
+            f"No checkpoints found under /tmp/rsl_rl_{env_prefix}_*/")
     # Sort by iteration number embedded in filename.
     pts.sort(
         key=lambda p: int(os.path.basename(p).split("_")[1].split(".")[0]))
