@@ -137,7 +137,7 @@ class QuantileCritic(MLPModel):
         output_dim: int,  # always 1 from PPO — accepted but ignored
         num_quantiles: int = 64,
         hidden_dims: list[int] | tuple[int, ...] = (64, 64),
-        activation: str = "elu",
+        activation: str = "mish",
         obs_normalization: bool = False,
     ) -> None:
         nn.Module.__init__(self)
@@ -515,9 +515,9 @@ ENV_PRESETS: dict[str, dict] = {
     },
     "Pusher-v5": {
         "num_learning_iterations": 2000,
-        "num_envs": 128,
-        "num_steps_per_env": 32,
-        "fsq_levels": [8, 8, 8],
+        "num_envs": 1024,
+        "num_steps_per_env": 24,
+        "fsq_levels": [8, 5, 5, 5],
         "encoder_hidden_dims": [128, 128],
         "decoder_hidden_dims": [64],
         "learning_rate": 1e-3,
@@ -527,7 +527,7 @@ ENV_PRESETS: dict[str, dict] = {
             "min_std": 0.1,
         },
         "use_quantile_critic": True,
-        "num_quantiles": 64,
+        "num_quantiles": 32,
         "qr_loss_coef": 1.0,
     },
 }
@@ -555,7 +555,7 @@ class FSQMLPModel(MLPModel):
         fsq_levels: list[int] | tuple[int, ...] = (8, 8, 8),
         encoder_hidden_dims: list[int] | tuple[int, ...] = (64, 64),
         decoder_hidden_dims: list[int] | tuple[int, ...] = (64, ),
-        activation: str = "elu",
+        activation: str = "mish",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
     ) -> None:
@@ -821,7 +821,7 @@ def make_fsq_ppo_cfg(preset: dict) -> dict:
         "fsq_levels": preset["fsq_levels"],
         "encoder_hidden_dims": preset["encoder_hidden_dims"],
         "decoder_hidden_dims": preset["decoder_hidden_dims"],
-        "activation": "elu",
+        "activation": "mish",
         "obs_normalization": True,
         "distribution_cfg": distribution_cfg,
     }
@@ -829,8 +829,8 @@ def make_fsq_ppo_cfg(preset: dict) -> dict:
         cfg["critic"] = {
             "class_name": QuantileCritic,
             "num_quantiles": preset.get("num_quantiles", 64),
-            "hidden_dims": [64, 64],
-            "activation": "elu",
+            "hidden_dims": [128, 128],
+            "activation": "mish",
             "obs_normalization": True,
         }
         cfg["algorithm"]["class_name"] = QuantilePPO
@@ -840,8 +840,8 @@ def make_fsq_ppo_cfg(preset: dict) -> dict:
     else:
         cfg["critic"] = {
             "class_name": "MLPModel",
-            "hidden_dims": [64, 64],
-            "activation": "elu",
+            "hidden_dims": [128, 128],
+            "activation": "mish",
             "obs_normalization": True,
         }
     return cfg
@@ -854,7 +854,7 @@ def make_mlp_ppo_cfg(preset: dict) -> dict:
     cfg["actor"] = {
         "class_name": "MLPModel",
         "hidden_dims": hidden,
-        "activation": "elu",
+        "activation": "mish",
         "obs_normalization": True,
         "distribution_cfg": {
             "class_name": "GaussianDistribution"
@@ -863,7 +863,7 @@ def make_mlp_ppo_cfg(preset: dict) -> dict:
     cfg["critic"] = {
         "class_name": "MLPModel",
         "hidden_dims": [64, 64],
-        "activation": "elu",
+        "activation": "mish",
         "obs_normalization": True,
     }
     return cfg

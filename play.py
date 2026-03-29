@@ -78,6 +78,7 @@ def play(env_id: str, policy, episodes: int, device: str,
     for ep in range(episodes):
         obs, _ = env.reset()
         total_reward = 0.0
+        steps = 0
         done = False
 
         while not done:
@@ -95,9 +96,10 @@ def play(env_id: str, policy, episodes: int, device: str,
 
             obs, reward, terminated, truncated, _ = env.step(action)
             total_reward += reward
+            steps += 1
             done = terminated or truncated
 
-        print(f"Episode {ep + 1:3d}  reward: {total_reward:.2f}")
+        print(f"Episode {ep + 1:3d}  reward: {total_reward:.2f}  steps: {steps}")
 
     env.close()
 

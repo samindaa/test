@@ -134,27 +134,32 @@ class FSQ(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Encoder(nn.Module):
-    """28×28 → (B, D, 7, 7)  where D = len(levels)."""
-    def __init__(self, latent_dim: int):
+    """28×28 → (B, hidden_dim, 7, 7)."""
+    def __init__(self, hidden_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 32, 4, stride=2, padding=1),          # 28 → 14
+            nn.Conv2d(1, 32, 4, stride=2, padding=1),           # 28 → 14
+            nn.GroupNorm(8, 32),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2, padding=1),          # 14 → 7
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),           # 14 → 7
+            nn.GroupNorm(8, 64),
             nn.ReLU(),
-            nn.Conv2d(64, latent_dim, 1),                        # project to D channels
+            nn.Conv2d(64, hidden_dim, 3, padding=1),             # 7 → 7, widen
+            nn.GroupNorm(8, hidden_dim),
+            nn.ReLU(),
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)   # (B, D, 7, 7)
+        return self.net(x)   # (B, hidden_dim, 7, 7)
 
 
 class Decoder(nn.Module):
-    """(B, D, 7, 7) → 28×28."""
-    def __init__(self, latent_dim: int):
+    """(B, hidden_dim, 7, 7) → 28×28."""
+    def __init__(self, hidden_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(latent_dim, 64, 1),
+            nn.Conv2d(hidden_dim, 64, 3, padding=1),
+            nn.ReLU(),
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # 7 → 14
             nn.ReLU(),
             nn.ConvTranspose2d(32, 1, 4, stride=2, padding=1),   # 14 → 28
@@ -171,27 +176,34 @@ class FSQVAE(nn.Module):
 
     Each image is encoded to a 7×7 grid. Every grid cell is independently
     quantized by FSQ, giving 49 code indices per image instead of 1.
-    This prevents codebook collapse.
+    Pre/post-quant projections decouple encoder width from FSQ dim.
     """
-    def __init__(self, levels: List[int]):
+    def __init__(self, levels: List[int], hidden_dim: int = 128):
         super().__init__()
-        self.latent_dim = len(levels)
-        self.encoder = Encoder(self.latent_dim)
+        self.latent_dim = hidden_dim
+        fsq_dim = len(levels)
+        self.encoder = Encoder(hidden_dim)
+        self.pre_quant = nn.Conv2d(hidden_dim, fsq_dim, 1)
         self.fsq = FSQ(levels)
-        self.decoder = Decoder(self.latent_dim)
+        self.post_quant = nn.Conv2d(fsq_dim, hidden_dim, 1)
+        self.decoder = Decoder(hidden_dim)
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         B = x.shape[0]
-        z = self.encoder(x)                          # (B, D, 7, 7)
+        fsq_dim = self.fsq.dim
 
-        # Rearrange to (B*49, D) so FSQ sees a flat batch of vectors
-        z = z.permute(0, 2, 3, 1).reshape(-1, self.latent_dim)   # (B*49, D)
-        z_q, indices = self.fsq(z)                               # (B*49, D), (B*49,)
+        z = self.encoder(x)                          # (B, hidden_dim, 7, 7)
+        z = self.pre_quant(z)                        # (B, fsq_dim, 7, 7)
 
-        # Restore spatial shape for decoder
-        z_q = z_q.reshape(B, 7, 7, self.latent_dim).permute(0, 3, 1, 2)  # (B, D, 7, 7)
-        indices = indices.reshape(B, 49)                                   # (B, 49)
+        # Rearrange to (B*49, fsq_dim) so FSQ sees a flat batch of vectors
+        z = z.permute(0, 2, 3, 1).reshape(-1, fsq_dim)   # (B*49, fsq_dim)
+        z_q, indices = self.fsq(z)                        # (B*49, fsq_dim), (B*49,)
 
+        # Restore spatial shape for post-quant projection and decoder
+        z_q = z_q.reshape(B, 7, 7, fsq_dim).permute(0, 3, 1, 2)  # (B, fsq_dim, 7, 7)
+        indices = indices.reshape(B, 49)                           # (B, 49)
+
+        z_q = self.post_quant(z_q)                                 # (B, hidden_dim, 7, 7)
         x_hat = self.decoder(z_q)
         return x_hat, indices
 
