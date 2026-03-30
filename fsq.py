@@ -228,12 +228,23 @@ class FSQVAE(nn.Module):
         return x_hat, indices, mu, logvar
 
     @torch.no_grad()
-    def sample(self, labels: Tensor, device: torch.device) -> Tensor:
-        """Generate images from class labels alone by sampling z ~ N(0, I)."""
+    def sample(self, labels: Tensor, device: torch.device,
+               class_mu: Tensor = None, temperature: float = 1.0) -> Tensor:
+        """Generate images from class labels alone.
+
+        Args:
+            labels:      (B,) class indices.
+            class_mu:    (num_classes, fsq_dim, 7, 7) per-class prior means computed
+                         from the training set. If None, falls back to N(0, I).
+            temperature: Noise scale; lower = less random, closer to class mean.
+        """
         B      = labels.shape[0]
-        eps    = torch.randn(B, self.fsq_dim, 7, 7, device=device)
-        z_flat = eps.permute(0, 2, 3, 1).reshape(-1, self.fsq_dim)
+        labels = labels.to(device)
+        mu_prior = class_mu[labels] if class_mu is not None \
+                   else torch.zeros(B, self.fsq_dim, 7, 7, device=device)
+        z      = mu_prior + temperature * torch.randn_like(mu_prior)
+        z_flat = z.permute(0, 2, 3, 1).reshape(-1, self.fsq_dim)
         z_q, _ = self.fsq(z_flat)
         z_q    = z_q.reshape(B, 7, 7, self.fsq_dim).permute(0, 3, 1, 2)
         z_q    = self.post_quant(z_q)
-        return self.decoder(z_q, labels.to(device))  # (B, 1, 28, 28)
+        return self.decoder(z_q, labels)  # (B, 1, 28, 28)

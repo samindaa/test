@@ -43,7 +43,8 @@ def train():
 
     checkpoint = "cvae_fsq_mnist.pt"
     if os.path.exists(checkpoint):
-        print(f"\nLoading existing model from {checkpoint}, skipping training.")
+        print(
+            f"\nLoading existing model from {checkpoint}, skipping training.")
         model.load_state_dict(torch.load(checkpoint, map_location=device))
     else:
         train_loader = DataLoader(train_dataset,
@@ -55,8 +56,8 @@ def train():
         # -------------------------------------------------------------------------
         # Train the CVAE-FSQ
         # -------------------------------------------------------------------------
-        n_epochs    = 30
-        beta_max    = 0.5
+        n_epochs = 50
+        beta_max = 0.5
         warmup_epochs = 10  # β ramps 0 → beta_max over first 10 epochs
 
         print("\n--- Train CVAE-FSQ ---")
@@ -64,18 +65,18 @@ def train():
             beta = beta_max * min(1.0, epoch / warmup_epochs)
             model.train()
             total_bce = 0.0
-            total_kl  = 0.0
+            total_kl = 0.0
             for x, labels in train_loader:
                 x, labels = x.to(device), labels.to(device)
                 x_hat, _, mu, logvar = model(x, labels)
-                bce  = F.binary_cross_entropy(x_hat, x)
-                kl   = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                bce = F.binary_cross_entropy(x_hat, x)
+                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
                 loss = bce + beta * kl
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 total_bce += bce.item()
-                total_kl  += kl.item()
+                total_kl += kl.item()
 
             model.eval()
             all_indices = []
@@ -89,19 +90,39 @@ def train():
             print(
                 f"Epoch {epoch:2d} | β={beta:.2f} | BCE: {total_bce/len(train_loader):.4f} | "
                 f"KL: {total_kl/len(train_loader):.4f} | "
-                f"Codes: {usage}/{model.fsq.codebook_size}"
-            )
+                f"Codes: {usage}/{model.fsq.codebook_size}")
 
         torch.save(model.state_dict(), checkpoint)
+
+    # -------------------------------------------------------------------------
+    # Compute per-class prior means from the encoder over the full training set.
+    # Using the empirical class mean of μ as the generation center is far more
+    # reliable than sampling from N(0,I) when the KL hasn't fully converged.
+    # -------------------------------------------------------------------------
+    model.eval()
+    num_classes = 10
+    class_mu = torch.zeros(num_classes, model.fsq_dim, 7, 7, device=device)
+    class_counts = torch.zeros(num_classes, device=device)
+    with torch.no_grad():
+        for x, labels in DataLoader(train_dataset,
+                                    batch_size=1024,
+                                    num_workers=0):
+            x, labels = x.to(device), labels.to(device)
+            h = model.encoder(x, labels)
+            mu = model.mu_head(h)  # (B, fsq_dim, 7, 7)
+            for c in range(num_classes):
+                mask = labels == c
+                if mask.any():
+                    class_mu[c] += mu[mask].sum(0)
+                    class_counts[c] += mask.sum()
+    class_mu /= class_counts[:, None, None, None]  # (10, fsq_dim, 7, 7)
 
     # -------------------------------------------------------------------------
     # Visualization: 10 columns (digits 0-9), 3 rows
     #   Row 0: one original image per digit
     #   Row 1: reconstruction
-    #   Row 2: generated from label alone (z ~ N(0,I))
+    #   Row 2: generated from label alone (sample around class mean)
     # -------------------------------------------------------------------------
-    model.eval()
-    num_classes = 10
 
     # Gather one example per digit from the dataset
     per_class = {}
@@ -115,28 +136,29 @@ def train():
         if len(per_class) == num_classes:
             break
 
-    class_x      = torch.stack([per_class[c] for c in range(num_classes)])  # (10, 1, 28, 28)
-    class_labels = torch.arange(num_classes)                                 # (10,)
+    class_x = torch.stack([per_class[c]
+                           for c in range(num_classes)])  # (10, 1, 28, 28)
+    class_labels = torch.arange(num_classes)  # (10,)
 
     with torch.no_grad():
         recon, _, _, _ = model(class_x.to(device), class_labels.to(device))
-        generated      = model.sample(class_labels, device)
+        generated = model.sample(class_labels, device, class_mu=class_mu)
 
-    originals     = class_x.squeeze(1).numpy()
+    originals = class_x.squeeze(1).numpy()
     reconstructed = recon.cpu().clamp(0, 1).squeeze(1).numpy()
-    generated_np  = generated.cpu().clamp(0, 1).squeeze(1).numpy()
+    generated_np = generated.cpu().clamp(0, 1).squeeze(1).numpy()
 
     _, axes = plt.subplots(3, num_classes, figsize=(num_classes * 1.5, 4.5))
     for c in range(num_classes):
-        axes[0, c].imshow(originals[c],     cmap="gray", vmin=0, vmax=1)
+        axes[0, c].imshow(originals[c], cmap="gray", vmin=0, vmax=1)
         axes[0, c].axis("off")
         axes[0, c].set_title(str(c), fontsize=9)
         axes[1, c].imshow(reconstructed[c], cmap="gray", vmin=0, vmax=1)
         axes[1, c].axis("off")
-        axes[2, c].imshow(generated_np[c],  cmap="gray", vmin=0, vmax=1)
+        axes[2, c].imshow(generated_np[c], cmap="gray", vmin=0, vmax=1)
         axes[2, c].axis("off")
-    axes[0, 0].set_ylabel("Original",  fontsize=8)
-    axes[1, 0].set_ylabel("Recon",     fontsize=8)
+    axes[0, 0].set_ylabel("Original", fontsize=8)
+    axes[1, 0].set_ylabel("Recon", fontsize=8)
     axes[2, 0].set_ylabel("Generated", fontsize=8)
     plt.tight_layout()
     plt.savefig("reconstructions.png", bbox_inches="tight")
