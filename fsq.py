@@ -133,148 +133,107 @@ class FSQ(nn.Module):
 # New approach: keep spatial grid → quantize each 7×7 cell  → 49 codes per image
 # ---------------------------------------------------------------------------
 
-class Encoder(nn.Module):
-    """28×28 → (B, hidden_dim, 7, 7)."""
-    def __init__(self, hidden_dim: int):
+class FiLM(nn.Module):
+    """Feature-wise Linear Modulation: scale + shift spatial features by a conditioning vector."""
+    def __init__(self, num_features: int, cond_dim: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 32, 4, stride=2, padding=1),           # 28 → 14
-            nn.GroupNorm(8, 32),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2, padding=1),           # 14 → 7
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            nn.Conv2d(64, hidden_dim, 3, padding=1),             # 7 → 7, widen
-            nn.GroupNorm(8, hidden_dim),
-            nn.ReLU(),
-        )
+        self.scale = nn.Linear(cond_dim, num_features)
+        self.shift = nn.Linear(cond_dim, num_features)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)   # (B, hidden_dim, 7, 7)
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        # x: (B, C, H, W),  cond: (B, cond_dim)
+        s = self.scale(cond)[:, :, None, None]  # (B, C, 1, 1)
+        b = self.shift(cond)[:, :, None, None]
+        return x * s + b
+
+
+class Encoder(nn.Module):
+    """28×28 → (B, hidden_dim, 7, 7), label-conditioned via FiLM."""
+    def __init__(self, hidden_dim: int, num_classes: int = 10, label_embed_dim: int = 32):
+        super().__init__()
+        self.label_embed = nn.Embedding(num_classes, label_embed_dim)
+        self.conv1 = nn.Conv2d(1, 32, 4, stride=2, padding=1)   # 28 → 14
+        self.norm1 = nn.GroupNorm(8, 32)
+        self.film1 = FiLM(32, label_embed_dim)
+        self.conv2 = nn.Conv2d(32, 64, 4, stride=2, padding=1)  # 14 → 7
+        self.norm2 = nn.GroupNorm(8, 64)
+        self.film2 = FiLM(64, label_embed_dim)
+        self.conv3 = nn.Conv2d(64, hidden_dim, 3, padding=1)    # 7 → 7, widen
+        self.norm3 = nn.GroupNorm(8, hidden_dim)
+        self.film3 = FiLM(hidden_dim, label_embed_dim)
+
+    def forward(self, x: Tensor, labels: Tensor) -> Tensor:
+        cond = self.label_embed(labels)                              # (B, label_embed_dim)
+        x = F.relu(self.film1(self.norm1(self.conv1(x)), cond))     # (B, 32, 14, 14)
+        x = F.relu(self.film2(self.norm2(self.conv2(x)), cond))     # (B, 64, 7, 7)
+        x = F.relu(self.film3(self.norm3(self.conv3(x)), cond))     # (B, hidden_dim, 7, 7)
+        return x
 
 
 class Decoder(nn.Module):
-    """(B, hidden_dim, 7, 7) → 28×28."""
-    def __init__(self, hidden_dim: int):
+    """(B, hidden_dim, 7, 7) + labels → 28×28, conditioned via FiLM."""
+    def __init__(self, hidden_dim: int, num_classes: int = 10, label_embed_dim: int = 32):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(hidden_dim, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # 7 → 14
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 1, 4, stride=2, padding=1),   # 14 → 28
-            nn.Sigmoid(),
-        )
+        self.label_embed = nn.Embedding(num_classes, label_embed_dim)
+        self.conv1 = nn.Conv2d(hidden_dim, 64, 3, padding=1)
+        self.film1 = FiLM(64, label_embed_dim)
+        self.up1   = nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1)  # 7 → 14
+        self.film2 = FiLM(32, label_embed_dim)
+        self.up2   = nn.ConvTranspose2d(32, 1, 4, stride=2, padding=1)   # 14 → 28
 
-    def forward(self, z: Tensor) -> Tensor:
-        return self.net(z)   # (B, 1, 28, 28)
+    def forward(self, z: Tensor, labels: Tensor) -> Tensor:
+        cond = self.label_embed(labels)                    # (B, label_embed_dim)
+        x = F.relu(self.film1(self.conv1(z), cond))       # (B, 64, 7, 7)
+        x = F.relu(self.film2(self.up1(x),  cond))        # (B, 32, 14, 14)
+        return torch.sigmoid(self.up2(x))                  # (B, 1, 28, 28)
 
 
 class FSQVAE(nn.Module):
     """
-    FSQ-VAE with spatial quantization.
+    CVAE-FSQ: label-conditioned encoder + Gaussian bottleneck + FSQ + label-conditioned decoder.
 
-    Each image is encoded to a 7×7 grid. Every grid cell is independently
-    quantized by FSQ, giving 49 code indices per image instead of 1.
-    Pre/post-quant projections decouple encoder width from FSQ dim.
+    Both encoder and decoder are conditioned on the class label via FiLM. The encoder
+    produces per-spatial-cell μ and log σ² (one Gaussian per 7×7 cell per fsq_dim channel).
+    Reparameterization samples z ~ N(μ, σ²); FSQ quantizes z with STE gradients.
+    KL loss pushes the posterior toward N(0,I), enabling generation by sampling directly
+    from N(0,I) and decoding with any desired label — no encoder needed at inference.
     """
-    def __init__(self, levels: List[int], hidden_dim: int = 128):
+    def __init__(self, levels: List[int], hidden_dim: int = 128,
+                 num_classes: int = 10, label_embed_dim: int = 32):
         super().__init__()
         self.latent_dim = hidden_dim
-        fsq_dim = len(levels)
-        self.encoder = Encoder(hidden_dim)
-        self.pre_quant = nn.Conv2d(hidden_dim, fsq_dim, 1)
-        self.fsq = FSQ(levels)
-        self.post_quant = nn.Conv2d(fsq_dim, hidden_dim, 1)
-        self.decoder = Decoder(hidden_dim)
+        self.fsq_dim = len(levels)
+        self.encoder     = Encoder(hidden_dim, num_classes, label_embed_dim)
+        self.mu_head     = nn.Conv2d(hidden_dim, self.fsq_dim, 1)
+        self.logvar_head = nn.Conv2d(hidden_dim, self.fsq_dim, 1)
+        self.fsq         = FSQ(levels)
+        self.post_quant  = nn.Conv2d(self.fsq_dim, hidden_dim, 1)
+        self.decoder     = Decoder(hidden_dim, num_classes, label_embed_dim)
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, labels: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         B = x.shape[0]
-        fsq_dim = self.fsq.dim
 
-        z = self.encoder(x)                          # (B, hidden_dim, 7, 7)
-        z = self.pre_quant(z)                        # (B, fsq_dim, 7, 7)
+        h      = self.encoder(x, labels)                           # (B, hidden_dim, 7, 7)
+        mu     = self.mu_head(h)                                   # (B, fsq_dim, 7, 7)
+        logvar = self.logvar_head(h).clamp(-10.0, 2.0)            # (B, fsq_dim, 7, 7)
+        z      = mu + (0.5 * logvar).exp() * torch.randn_like(mu) # reparameterize
 
-        # Rearrange to (B*49, fsq_dim) so FSQ sees a flat batch of vectors
-        z = z.permute(0, 2, 3, 1).reshape(-1, fsq_dim)   # (B*49, fsq_dim)
-        z_q, indices = self.fsq(z)                        # (B*49, fsq_dim), (B*49,)
+        z_flat       = z.permute(0, 2, 3, 1).reshape(-1, self.fsq_dim)  # (B*49, fsq_dim)
+        z_q, indices = self.fsq(z_flat)                                  # STE gradients
+        z_q          = z_q.reshape(B, 7, 7, self.fsq_dim).permute(0, 3, 1, 2)  # (B, fsq_dim, 7, 7)
+        indices      = indices.reshape(B, 49)
 
-        # Restore spatial shape for post-quant projection and decoder
-        z_q = z_q.reshape(B, 7, 7, fsq_dim).permute(0, 3, 1, 2)  # (B, fsq_dim, 7, 7)
-        indices = indices.reshape(B, 49)                           # (B, 49)
-
-        z_q = self.post_quant(z_q)                                 # (B, hidden_dim, 7, 7)
-        x_hat = self.decoder(z_q)
-        return x_hat, indices
-
-
-# ---------------------------------------------------------------------------
-# Learnable Conditional Prior
-# ---------------------------------------------------------------------------
-
-class ConditionalPrior(nn.Module):
-    """
-    Learnable conditional prior: P(code_index | condition).
-
-    Models the distribution over FSQ codebook indices conditioned on a
-    conditioning signal (e.g. class label). Trained independently after
-    the FSQ-VAE is frozen, enabling conditional generation by sampling
-    from this prior and decoding through the FSQ decoder.
-
-    Args:
-        codebook_size: Total number of FSQ codes (product of all levels).
-        num_classes:   Number of conditioning classes.
-        hidden_dim:    Width of the MLP layers.
-    """
-
-    def __init__(self, codebook_size: int, num_classes: int, hidden_dim: int = 256):
-        super().__init__()
-        self.codebook_size = codebook_size
-
-        # Learned embedding for the conditioning signal
-        self.class_embedding = nn.Embedding(num_classes, hidden_dim)
-
-        # MLP that maps condition -> logits over all codebook entries
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, codebook_size),
-        )
-
-    def forward(self, labels: Tensor) -> Tensor:
-        """
-        Args:
-            labels: Long tensor of shape (B,) with class indices.
-        Returns:
-            logits: Tensor of shape (B, codebook_size) — unnormalised log-probs.
-        """
-        cond = self.class_embedding(labels)   # (B, hidden_dim)
-        return self.net(cond)                  # (B, codebook_size)
-
-    def loss(self, labels: Tensor, target_indices: Tensor) -> Tensor:
-        """
-        Cross-entropy loss: -log P(target_index | label).
-
-        Args:
-            labels:         Long tensor (B,) of class labels.
-            target_indices: Long tensor (B,) of FSQ code indices from the encoder.
-        """
-        logits = self.forward(labels)
-        return F.cross_entropy(logits, target_indices)
+        z_q   = self.post_quant(z_q)      # (B, hidden_dim, 7, 7)
+        x_hat = self.decoder(z_q, labels) # (B, 1, 28, 28)
+        return x_hat, indices, mu, logvar
 
     @torch.no_grad()
-    def sample(self, labels: Tensor, temperature: float = 1.0) -> Tensor:
-        """
-        Sample a code index for each label.
-
-        Args:
-            labels:      Long tensor (B,) of class labels.
-            temperature: Sampling temperature. 1.0 = standard, <1 = sharper.
-        Returns:
-            indices: Long tensor (B,) of sampled FSQ code indices.
-        """
-        logits = self.forward(labels) / temperature
-        probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    def sample(self, labels: Tensor, device: torch.device) -> Tensor:
+        """Generate images from class labels alone by sampling z ~ N(0, I)."""
+        B      = labels.shape[0]
+        eps    = torch.randn(B, self.fsq_dim, 7, 7, device=device)
+        z_flat = eps.permute(0, 2, 3, 1).reshape(-1, self.fsq_dim)
+        z_q, _ = self.fsq(z_flat)
+        z_q    = z_q.reshape(B, 7, 7, self.fsq_dim).permute(0, 3, 1, 2)
+        z_q    = self.post_quant(z_q)
+        return self.decoder(z_q, labels.to(device))  # (B, 1, 28, 28)
