@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from fsq import FSQVAE
+from fsq import LearnedPriorFSQVAE, kl_two_gaussians
 
 SPATIAL_POSITIONS = 49  # 7×7 grid cells per image
 
@@ -30,7 +30,7 @@ def train():
 
     # 4096 codes; pre/post-quant projections keep encoder at 128 channels
     levels = [8, 8, 8]
-    model = FSQVAE(levels, hidden_dim=128).to(device)
+    model = LearnedPriorFSQVAE(levels, hidden_dim=128).to(device)
 
     print(f"FSQ codebook size: {model.fsq.codebook_size}")
     print(f"Codes per image:   {SPATIAL_POSITIONS} (7×7 spatial grid)")
@@ -41,7 +41,7 @@ def train():
                                    download=True,
                                    transform=transform)
 
-    checkpoint = "cvae_fsq_mnist.pt"
+    checkpoint = "cvae_fsq_learned_prior_mnist.pt"
     if os.path.exists(checkpoint):
         print(
             f"\nLoading existing model from {checkpoint}, skipping training.")
@@ -68,9 +68,9 @@ def train():
             total_kl = 0.0
             for x, labels in train_loader:
                 x, labels = x.to(device), labels.to(device)
-                x_hat, _, mu, logvar = model(x, labels)
+                x_hat, _, mu_q, logvar_q, mu_p, logvar_p = model(x, labels)
                 bce = F.binary_cross_entropy(x_hat, x)
-                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                kl = kl_two_gaussians(mu_q, logvar_q, mu_p, logvar_p)
                 loss = bce + beta * kl
                 optimizer.zero_grad()
                 loss.backward()
@@ -84,7 +84,7 @@ def train():
                 for x, labels in DataLoader(train_dataset,
                                             batch_size=1024,
                                             num_workers=0):
-                    _, idx, _, _ = model(x.to(device), labels.to(device))
+                    _, idx, _, _, _, _ = model(x.to(device), labels.to(device))
                     all_indices.append(idx.cpu())
             usage = torch.cat(all_indices).unique().numel()
             print(
@@ -94,28 +94,8 @@ def train():
 
         torch.save(model.state_dict(), checkpoint)
 
-    # -------------------------------------------------------------------------
-    # Compute per-class prior means from the encoder over the full training set.
-    # Using the empirical class mean of μ as the generation center is far more
-    # reliable than sampling from N(0,I) when the KL hasn't fully converged.
-    # -------------------------------------------------------------------------
     model.eval()
     num_classes = 10
-    class_mu = torch.zeros(num_classes, model.fsq_dim, 7, 7, device=device)
-    class_counts = torch.zeros(num_classes, device=device)
-    with torch.no_grad():
-        for x, labels in DataLoader(train_dataset,
-                                    batch_size=1024,
-                                    num_workers=0):
-            x, labels = x.to(device), labels.to(device)
-            h = model.encoder(x, labels)
-            mu = model.mu_head(h)  # (B, fsq_dim, 7, 7)
-            for c in range(num_classes):
-                mask = labels == c
-                if mask.any():
-                    class_mu[c] += mu[mask].sum(0)
-                    class_counts[c] += mask.sum()
-    class_mu /= class_counts[:, None, None, None]  # (10, fsq_dim, 7, 7)
 
     # -------------------------------------------------------------------------
     # Visualization: 10 columns (digits 0-9), 3 rows
@@ -141,8 +121,8 @@ def train():
     class_labels = torch.arange(num_classes)  # (10,)
 
     with torch.no_grad():
-        recon, _, _, _ = model(class_x.to(device), class_labels.to(device))
-        generated = model.sample(class_labels, device, class_mu=class_mu)
+        recon, _, _, _, _, _ = model(class_x.to(device), class_labels.to(device))
+        generated = model.sample(class_labels, device)
 
     originals = class_x.squeeze(1).numpy()
     reconstructed = recon.cpu().clamp(0, 1).squeeze(1).numpy()

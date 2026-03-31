@@ -248,3 +248,134 @@ class FSQVAE(nn.Module):
         z_q    = z_q.reshape(B, 7, 7, self.fsq_dim).permute(0, 3, 1, 2)
         z_q    = self.post_quant(z_q)
         return self.decoder(z_q, labels)  # (B, 1, 28, 28)
+
+
+# ---------------------------------------------------------------------------
+# Learned conditional prior: p(z | c)
+# ---------------------------------------------------------------------------
+
+def kl_two_gaussians(
+    mu_q: Tensor, logvar_q: Tensor,
+    mu_p: Tensor, logvar_p: Tensor,
+) -> Tensor:
+    """Analytial KL(q || p) for two diagonal Gaussians.
+
+    KL(N(μ_q, σ_q²) || N(μ_p, σ_p²)) =
+        ½ [ log(σ_p²/σ_q²) + (σ_q² + (μ_q - μ_p)²) / σ_p² - 1 ]
+
+    Returns scalar mean over all elements.
+    """
+    return 0.5 * torch.mean(
+        logvar_p - logvar_q
+        + (logvar_q.exp() + (mu_q - mu_p).pow(2)) / logvar_p.exp()
+        - 1.0
+    )
+
+
+class PriorNet(nn.Module):
+    """Learned conditional prior p(z | c).
+
+    Maps a class label to per-spatial-cell Gaussian parameters (μ_prior, logvar_prior)
+    matching the shape of the FSQVAE posterior: (B, fsq_dim, spatial, spatial).
+
+    At generation time, sample z ~ N(μ_prior, exp(logvar_prior)) directly — no
+    empirical class-mean workaround needed.
+    """
+
+    def __init__(
+        self,
+        fsq_dim: int,
+        spatial: int = 7,
+        num_classes: int = 10,
+        label_embed_dim: int = 32,
+    ):
+        super().__init__()
+        self.fsq_dim = fsq_dim
+        self.spatial = spatial
+        self.label_embed = nn.Embedding(num_classes, label_embed_dim)
+        self.net = nn.Sequential(
+            nn.Linear(label_embed_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2 * fsq_dim * spatial * spatial),
+        )
+
+    def forward(self, labels: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Args:
+            labels: (B,) class indices.
+        Returns:
+            mu_prior:     (B, fsq_dim, spatial, spatial)
+            logvar_prior: (B, fsq_dim, spatial, spatial)  clamped to [-10, 2]
+        """
+        B = labels.shape[0]
+        cond = self.label_embed(labels)                                  # (B, embed_dim)
+        out = self.net(cond)                                             # (B, 2*fsq_dim*H*W)
+        out = out.view(B, 2, self.fsq_dim, self.spatial, self.spatial)
+        mu_prior     = out[:, 0]                                         # (B, fsq_dim, H, W)
+        logvar_prior = out[:, 1].clamp(-10.0, 2.0)
+        return mu_prior, logvar_prior
+
+
+class LearnedPriorFSQVAE(FSQVAE):
+    """CVAE-FSQ with a learnable conditional prior p(z | c).
+
+    Extends FSQVAE by replacing the fixed N(0,I) prior with a learned network
+    that maps the class label to per-cell Gaussian parameters (μ_p, σ_p²).
+
+    Training loss changes from:
+        KL(q(z|x,c) || N(0,I))
+    to:
+        KL(q(z|x,c) || p(z|c))       ← both are diagonal Gaussians, closed form
+
+    Generation uses p(z|c) directly — sample z ~ N(μ_p(c), σ_p²(c)) and decode.
+    """
+
+    def __init__(
+        self,
+        levels: List[int],
+        hidden_dim: int = 128,
+        num_classes: int = 10,
+        label_embed_dim: int = 32,
+        spatial: int = 7,
+    ):
+        super().__init__(levels, hidden_dim, num_classes, label_embed_dim)
+        self.prior_net = PriorNet(self.fsq_dim, spatial, num_classes, label_embed_dim)
+
+    def forward(
+        self, x: Tensor, labels: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """
+        Returns:
+            x_hat:        (B, 1, 28, 28)  reconstructed image
+            indices:      (B, 49)         FSQ code indices
+            mu_q:         (B, fsq_dim, 7, 7)  posterior mean
+            logvar_q:     (B, fsq_dim, 7, 7)  posterior log-variance
+            mu_p:         (B, fsq_dim, 7, 7)  prior mean from PriorNet
+            logvar_p:     (B, fsq_dim, 7, 7)  prior log-variance from PriorNet
+        """
+        x_hat, indices, mu_q, logvar_q = super().forward(x, labels)
+        mu_p, logvar_p = self.prior_net(labels)
+        return x_hat, indices, mu_q, logvar_q, mu_p, logvar_p
+
+    @torch.no_grad()
+    def sample(
+        self, labels: Tensor, device: torch.device, temperature: float = 1.0
+    ) -> Tensor:
+        """Generate images by sampling from the learned prior p(z | c).
+
+        Args:
+            labels:      (B,) class indices.
+            temperature: Scales the prior std; 1.0 = exact prior sample.
+        Returns:
+            (B, 1, 28, 28) generated images.
+        """
+        B      = labels.shape[0]
+        labels = labels.to(device)
+        mu_p, logvar_p = self.prior_net(labels)                         # (B, fsq_dim, H, W)
+        z = mu_p + temperature * (0.5 * logvar_p).exp() * torch.randn_like(mu_p)
+        z_flat = z.permute(0, 2, 3, 1).reshape(-1, self.fsq_dim)
+        z_q, _ = self.fsq(z_flat)
+        z_q    = z_q.reshape(B, self.prior_net.spatial, self.prior_net.spatial,
+                              self.fsq_dim).permute(0, 3, 1, 2)
+        z_q    = self.post_quant(z_q)
+        return self.decoder(z_q, labels)
