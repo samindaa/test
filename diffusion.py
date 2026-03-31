@@ -78,7 +78,7 @@ class DDPMSchedule:
         return sqrt_ab * x0 + sqrt_1mab * noise, noise
 
     @torch.no_grad()
-    def p_sample(self, model, x_t, t_scalar):
+    def p_sample(self, model, x_t, t_scalar, y=None):
         """
         One reverse step: DDPM Algorithm 2 (Ho et al. 2020).
 
@@ -95,7 +95,7 @@ class DDPMSchedule:
         B = x_t.shape[0]
         t_tensor = torch.full((B,), t_scalar, device=self.device, dtype=torch.long)
 
-        eps_pred = model(x_t, t_tensor)
+        eps_pred = model(x_t, t_tensor, y)
 
         # coef = beta_t / sqrt(1 - alpha_bar_t)  — always safe, sqrt(1-ab) ≥ 0
         # 1/sqrt(alpha_t) — safe because betas are clamped to 0.999 so alpha ≥ 0.001
@@ -108,12 +108,12 @@ class DDPMSchedule:
         return mean + self.posterior_variance[t_scalar].sqrt() * noise
 
     @torch.no_grad()
-    def sample(self, model, shape):
-        """Full reverse chain: x_T -> x_0"""
+    def sample(self, model, shape, y=None):
+        """Full reverse chain: x_T -> x_0.  y: (B,) class labels or None."""
         model.eval()
         x = torch.randn(shape, device=self.device)
         for t in reversed(range(self.T)):
-            x = self.p_sample(model, x, t)
+            x = self.p_sample(model, x, t, y)
         return x.clamp(-1, 1)
 
 
@@ -203,9 +203,15 @@ class DiT(nn.Module):
         -> patchify into (B, N, patch_dim)   where N = (28/p)^2
         -> linear embed to (B, N, dim)
         -> add 2D positional embeddings
-        -> N transformer blocks conditioned on timestep embedding
+        -> N transformer blocks conditioned on (timestep + class) embedding
         -> linear project back to (B, N, patch_dim)
         -> unpatchify to (B, 1, 28, 28)  <- predicted noise
+
+    Class conditioning: the class label embedding is added to the timestep
+    embedding so every transformer block knows both *when* in the diffusion
+    and *what digit* to generate.  This turns one hard joint distribution
+    over 10 classes into 10 separate easy ones — by far the biggest quality
+    improvement for MNIST.
     """
     def __init__(
         self,
@@ -215,6 +221,7 @@ class DiT(nn.Module):
         dim=128,
         depth=4,
         n_heads=4,
+        num_classes=10,
     ):
         super().__init__()
         assert img_size % patch_size == 0
@@ -232,6 +239,9 @@ class DiT(nn.Module):
         )
         self._t_sinusoid_dim = dim
 
+        # Class embedding — same dimension as t_dim so we can add them together
+        self.class_embed = nn.Embedding(num_classes, t_dim)
+
         # Patch embedding
         self.patch_embed = nn.Linear(patch_dim, dim)
 
@@ -246,8 +256,11 @@ class DiT(nn.Module):
         ])
 
         # Final norm + output projection
+        # Zero-init: model starts predicting ~0 noise, giving clear initial gradients
         self.norm_out = nn.LayerNorm(dim)
         self.out_proj = nn.Linear(dim, patch_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def patchify(self, x):
         """(B,C,H,W) -> (B, N, C*p*p)"""
@@ -269,15 +282,18 @@ class DiT(nn.Module):
         x  = x.reshape(x.shape[0], C, H, W)
         return x
 
-    def forward(self, x, t):
+    def forward(self, x, t, y=None):
         """
         x: (B, 1, 28, 28) noisy image
         t: (B,) integer timesteps
+        y: (B,) integer class labels 0-9, or None for unconditional
         Returns: predicted noise (B, 1, 28, 28)
         """
-        # Timestep conditioning
+        # Timestep + class conditioning
         t_emb = sinusoidal_embedding(t, self._t_sinusoid_dim)   # (B, dim)
         cond  = self.t_embed(t_emb)                              # (B, t_dim)
+        if y is not None:
+            cond = cond + self.class_embed(y)                    # add class info
 
         # Patchify + embed
         tokens = self.patchify(x)                  # (B, N, patch_dim)
@@ -326,7 +342,7 @@ class EMA:
 # ---------------------------------------------------------------------------
 
 def train(
-    epochs=50,
+    epochs=100,
     batch_size=256,
     lr=1e-3,
     T=500,
@@ -346,7 +362,7 @@ def train(
     loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
     schedule = DDPMSchedule(T=T, device=device)
-    model    = DiT(img_size=28, patch_size=4, dim=128, depth=4, n_heads=4).to(device)
+    model    = DiT(img_size=28, patch_size=4, dim=128, depth=4, n_heads=4, num_classes=10).to(device)
     ema      = EMA(model, decay=0.999)
     opt      = torch.optim.AdamW(model.parameters(), lr=lr)
     # Cosine LR with eta_min=1e-5 — keeps learning rate from dying to zero
@@ -359,8 +375,9 @@ def train(
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
-        for x, _ in loader:
+        for x, y in loader:
             x = x.to(device)
+            y = y.to(device)
             B = x.shape[0]
 
             # Sample random timesteps
@@ -369,8 +386,8 @@ def train(
             # Forward process: add noise
             x_noisy, noise_true = schedule.q_sample(x, t)
 
-            # Predict noise
-            noise_pred = model(x_noisy, t)
+            # Predict noise — pass class labels for conditioning
+            noise_pred = model(x_noisy, t, y)
 
             # Simple MSE loss (Ho et al. use this exact loss)
             loss = F.mse_loss(noise_pred, noise_true)
@@ -389,12 +406,14 @@ def train(
         print(f"Epoch {epoch:03d} | loss: {avg_loss:.4f} | lr: {scheduler.get_last_lr()[0]:.2e}")
 
         if epoch % save_every == 0 or epoch == epochs:
-            # Sample using EMA weights (much better quality than raw model)
-            ema_model = DiT(img_size=28, patch_size=4, dim=128, depth=4, n_heads=4).to(device)
+            # Sample 2 of each digit (0-9) using EMA weights
+            ema_model = DiT(img_size=28, patch_size=4, dim=128, depth=4, n_heads=4, num_classes=10).to(device)
             ema.copy_to(ema_model)
-            samples = schedule.sample(ema_model, shape=(16, 1, 28, 28))
+            # y = [0,1,2,...,9, 0,1,...,9] — two rows of digits
+            y_sample = torch.arange(10, device=device).repeat(2)
+            samples = schedule.sample(ema_model, shape=(20, 1, 28, 28), y=y_sample)
             samples = (samples + 1) / 2  # back to [0,1]
-            save_image(samples, f"diffusion_samples_epoch{epoch:03d}.png", nrow=4)
+            save_image(samples, f"diffusion_samples_epoch{epoch:03d}.png", nrow=10)
             print(f"  Saved EMA samples -> diffusion_samples_epoch{epoch:03d}.png")
 
     torch.save(model.state_dict(), "diffusion_dit_mnist.pt")
@@ -460,7 +479,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Training DiT diffusion model on MNIST...")
     model, schedule = train(
-        epochs=50,
+        epochs=100,
         batch_size=256,
         lr=1e-3,
         T=500,
