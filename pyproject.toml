@@ -12,6 +12,8 @@ dependencies = [
     "imageio>=2.37.3",
     "rsl-rl-lib==5.0.1",
     "tensorboard>=2.19.0",
+    "torchvision>=0.20.0",
+    "matplotlib>=3.9.0",
 ]
 
 [project.scripts]
