@@ -80,28 +80,27 @@ class DDPMSchedule:
     @torch.no_grad()
     def p_sample(self, model, x_t, t_scalar):
         """
-        One reverse step: given x_t and scalar timestep t, produce x_{t-1}.
-        Uses DDPM reverse formula.
+        One reverse step: DDPM Algorithm 2 (Ho et al. 2020).
+
+        Direct formula — does NOT reconstruct x0 first.
+        mu_t = (1/sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * eps_pred)
+
+        Why the old x0_pred approach was broken:
+          x0_pred = (x_t - sqrt(1-ab)*eps) / sqrt(ab)
+          With the cosine schedule, alpha_bar[T-1] = cos(π/2)² = 0 exactly,
+          and the float32 cumprod underflows to 0 for the last ~30 steps.
+          Dividing by 0 gives Inf on the very first sample step → NaN propagates
+          through the entire chain → pure noise output.
         """
         B = x_t.shape[0]
         t_tensor = torch.full((B,), t_scalar, device=self.device, dtype=torch.long)
 
-        # Predict noise
         eps_pred = model(x_t, t_tensor)
 
-        # Reconstruct x_0 estimate
-        sqrt_ab   = self.sqrt_alpha_bar[t_scalar]
-        sqrt_1mab = self.sqrt_one_minus_alpha_bar[t_scalar]
-        x0_pred = (x_t - sqrt_1mab * eps_pred) / sqrt_ab
-
-        # Compute posterior mean
-        alpha     = self.alphas[t_scalar]
-        alpha_bar = self.alpha_bar[t_scalar]
-        alpha_bar_prev = self.alpha_bar[t_scalar - 1] if t_scalar > 0 else torch.tensor(1.0)
-
-        coef1 = (alpha_bar_prev.sqrt() * self.betas[t_scalar]) / (1 - alpha_bar)
-        coef2 = (alpha.sqrt() * (1 - alpha_bar_prev)) / (1 - alpha_bar)
-        mean  = coef1 * x0_pred + coef2 * x_t
+        # coef = beta_t / sqrt(1 - alpha_bar_t)  — always safe, sqrt(1-ab) ≥ 0
+        # 1/sqrt(alpha_t) — safe because betas are clamped to 0.999 so alpha ≥ 0.001
+        coef = self.betas[t_scalar] / self.sqrt_one_minus_alpha_bar[t_scalar]
+        mean = (x_t - coef * eps_pred) / self.alphas[t_scalar].sqrt()
 
         if t_scalar == 0:
             return mean
@@ -348,10 +347,10 @@ def train(
 
     schedule = DDPMSchedule(T=T, device=device)
     model    = DiT(img_size=28, patch_size=4, dim=128, depth=4, n_heads=4).to(device)
-    ema      = EMA(model, decay=0.9999)
+    ema      = EMA(model, decay=0.999)
     opt      = torch.optim.AdamW(model.parameters(), lr=lr)
-    # Cosine LR decay: slowly lower LR over training for fine-grained convergence
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    # Cosine LR with eta_min=1e-5 — keeps learning rate from dying to zero
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
