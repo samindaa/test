@@ -7,14 +7,16 @@ import logging
 from typing import Any, Callable
 
 import engines.engine as engine
-import engines.mjlab_recorder as mjlab_recorder
-from mjlab.actuator import IdealPdActuator, IdealPdActuatorCfg
+
+# import engines.mjlab_recorder as mjlab_recorder
+from mjlab.actuator import IdealPdActuator, IdealPdActuatorCfg, XmlActuatorCfg
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+from mjlab.entity.entity import Entity
 from mjlab.scene import Scene
 from mjlab.scene.scene import SceneCfg
 from mjlab.sim.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains.terrain_entity import TerrainEntityCfg
-from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
+from mjlab.utils.lab_api.math import quat_apply
 from mjlab.utils.mujoco import dof_width, qpos_width
 import mujoco
 import numpy as np
@@ -31,52 +33,66 @@ def _mk_to_mj_quat(q: torch.Tensor) -> torch.Tensor:
   return q[..., [3, 0, 1, 2]]
 
 
+_ZEROS_3 = np.zeros((3, 1), dtype=np.float64)
+
+
+def _strip_passive_joint_forces(spec: mujoco.MjSpec) -> None:
+  """Zero out joint ``stiffness`` and ``damping`` on every joint.
+
+  Newton interprets the MJCF's ``stiffness``/``damping`` purely as PD gains
+  for its joint-target controller and explicitly zeros them as *passive*
+  forces (see newton_engine ``_build_controls``). Without this, MuJoCo
+  applies them as passive restoring/damping forces every step while newton
+  does not — producing a constant systematic bias on every actuated dof.
+
+  ``MjsJoint.stiffness`` and ``.damping`` are exposed as ``(3, 1)`` arrays
+  (per-axis for ball joints; for hinges/slides MuJoCo reads only [0]).
+  """
+  for joint in spec.joints:
+    joint.stiffness = _ZEROS_3
+    joint.damping = _ZEROS_3
+
+
 @dataclasses.dataclass(eq=False)
 class ObjInfo:
-  """Struct to store per-object indexing and metadata."""
+  """Per-object configuration and state not derivable from the Entity.
 
-  body_start: int = 0
-  body_end: int = 0
-  num_bodies: int = 0
-  body_names: list[str] = dataclasses.field(default_factory=list)
-  q_dof_start: int = 0
-  q_dof_end: int = 0
-  v_dof_start: int = 0
-  v_dof_end: int = 0
-  num_dofs: int = 0
-  ctrl_start: int = 0
-  ctrl_end: int = 0
-  has_free_joint: bool = False
-  has_sphere_joints: bool = False
-  enable_self_collisions: bool = False
-  sphere_q_starts: list[int] = dataclasses.field(default_factory=list)
-  sphere_v_starts: list[int] = dataclasses.field(default_factory=list)
-  nonsphere_q_indices: list[int] = dataclasses.field(default_factory=list)
-  nonsphere_v_indices: list[int] = dataclasses.field(default_factory=list)
+  Indexing (body/joint/ctrl IDs and addresses, free-joint presence, body
+  names, counts) is read from ``scene.entities[...]`` and its
+  ``indexing`` at access time rather than mirrored here.
+  """
+
+  # Configuration.
+  obj_type: str = ""
+  name: str = ""
   asset_file: str = ""
-  q_root_start: int = 0
-  v_root_start: int = 0
+  is_visual: bool = False
+  enable_self_collisions: bool = False
   fix_root: bool = False
   disable_motors: bool = False
   color: list[float] | None = None
-  obj_type: str = ""
-  name: str = ""
-  is_visual: bool = False
   start_pos: np.ndarray | None = None
   start_rot: np.ndarray | None = None
   per_joint_kp: list[float] = dataclasses.field(default_factory=list)
   per_joint_kd: list[float] = dataclasses.field(default_factory=list)
 
+  # Sphere/ball joint bookkeeping. Not exposed by Entity, so cached here.
+  has_sphere_joints: bool = False
+  sphere_q_starts: list[int] = dataclasses.field(default_factory=list)
+  sphere_v_starts: list[int] = dataclasses.field(default_factory=list)
+  nonsphere_q_indices: list[int] = dataclasses.field(default_factory=list)
+  nonsphere_v_indices: list[int] = dataclasses.field(default_factory=list)
+
   def _config_key(self) -> tuple:
     """Return a hashable key from configuration fields."""
     color_key = tuple(self.color) if self.color is not None else None
     return (
-        self.asset_file,
-        self.fix_root,
-        self.is_visual,
-        self.enable_self_collisions,
-        self.disable_motors,
-        color_key,
+      self.asset_file,
+      self.fix_root,
+      self.is_visual,
+      self.enable_self_collisions,
+      self.disable_motors,
+      color_key,
     )
 
   def __hash__(self) -> int:
@@ -97,12 +113,12 @@ class MjlabEngine(engine.Engine):
   """
 
   def __init__(
-      self,
-      config: dict[str, Any],
-      num_envs: int,
-      device: str,
-      visualize: bool,
-      record_video: bool = False,
+    self,
+    config: dict[str, Any],
+    num_envs: int,
+    device: str,
+    visualize: bool,
+    record_video: bool = False,
   ) -> None:
     super().__init__(visualize=visualize)
 
@@ -113,9 +129,9 @@ class MjlabEngine(engine.Engine):
 
     sim_freq: int = config.get("sim_freq", 240)
     control_freq: int = config.get("control_freq", 30)
-    assert (
-        sim_freq >= control_freq and sim_freq % control_freq == 0
-    ), "Simulation frequency must be a multiple of the control frequency"
+    assert sim_freq >= control_freq and sim_freq % control_freq == 0, (
+      "Simulation frequency must be a multiple of the control frequency"
+    )
 
     self._timestep: float = 1.0 / control_freq
     self._sim_steps: int = int(sim_freq / control_freq)
@@ -124,7 +140,7 @@ class MjlabEngine(engine.Engine):
 
     if "control_mode" in config:
       self._control_mode: engine.ControlMode = engine.ControlMode[
-          config["control_mode"]
+        config["control_mode"]
       ]
     else:
       self._control_mode = engine.ControlMode.none
@@ -162,18 +178,18 @@ class MjlabEngine(engine.Engine):
     return env_id
 
   def create_obj(
-      self,
-      env_id: int,
-      obj_type: str,
-      asset_file: str,
-      name: str,
-      is_visual: bool = False,
-      enable_self_collisions: bool = True,
-      fix_root: bool = False,
-      start_pos: np.ndarray | None = None,
-      start_rot: np.ndarray | None = None,
-      color: list[float] | None = None,
-      disable_motors: bool = False,
+    self,
+    env_id: int,
+    obj_type: str,
+    asset_file: str,
+    name: str,
+    is_visual: bool = False,
+    enable_self_collisions: bool = True,
+    fix_root: bool = False,
+    start_pos: np.ndarray | None = None,
+    start_rot: np.ndarray | None = None,
+    color: list[float] | None = None,
+    disable_motors: bool = False,
   ) -> int:
     if start_rot is None:
       start_rot = np.array([0.0, 0.0, 0.0, 1.0])  # xyzw identity
@@ -182,16 +198,16 @@ class MjlabEngine(engine.Engine):
       start_pos = np.array([0.0, 0.0, 0.0])
 
     obj_info = ObjInfo(
-        obj_type=obj_type,
-        asset_file=asset_file,
-        name=name,
-        fix_root=fix_root,
-        is_visual=is_visual,
-        enable_self_collisions=enable_self_collisions,
-        start_pos=start_pos,
-        start_rot=start_rot,
-        color=color,
-        disable_motors=disable_motors,
+      obj_type=obj_type,
+      asset_file=asset_file,
+      name=name,
+      fix_root=fix_root,
+      is_visual=is_visual,
+      enable_self_collisions=enable_self_collisions,
+      start_pos=start_pos,
+      start_rot=start_rot,
+      color=color,
+      disable_motors=disable_motors,
     )
 
     # Reuse existing ObjInfo for identical configs
@@ -222,10 +238,10 @@ class MjlabEngine(engine.Engine):
 
     # Build SceneCfg
     scene_cfg = SceneCfg(
-        num_envs=self._num_envs,
-        env_spacing=self._env_spacing,
-        entities=entities,
-        terrain=TerrainEntityCfg(terrain_type="plane"),
+      num_envs=self._num_envs,
+      env_spacing=self._env_spacing,
+      entities=entities,
+      terrain=TerrainEntityCfg(terrain_type="plane"),
     )
 
     # Create Scene → compile → Simulation (ManagerBasedRlEnv pattern)
@@ -233,96 +249,45 @@ class MjlabEngine(engine.Engine):
 
     logging.info("Creating Simulation...")
     sim_cfg = SimulationCfg(
-        njmax=500,
-        nconmax=300,
-        mujoco=MujocoCfg(
-            timestep=self._sim_timestep,
-            solver=self._solver_type,
-            integrator=self._integrator,
-            iterations=self._solver_iterations,
-            ls_iterations=self._ls_iterations,
-        ),
+      njmax=500,
+      nconmax=300,
+      mujoco=MujocoCfg(
+        timestep=self._sim_timestep,
+        solver=self._solver_type,
+        integrator=self._integrator,
+        iterations=self._solver_iterations,
+        ls_iterations=self._ls_iterations,
+      ),
     )
 
     self._sim = Simulation(
-        num_envs=self._num_envs,
-        cfg=sim_cfg,
-        model=self._scene.compile(),
-        device=self._device,
+      num_envs=self._num_envs,
+      cfg=sim_cfg,
+      model=self._scene.compile(),
+      device=self._device,
     )
     self._mj_model = self._sim.mj_model
 
     # Initialize scene (wires entities to model/data)
     self._scene.initialize(
-        mj_model=self._mj_model,
-        model=self._sim.model,
-        data=self._sim.data,
+      mj_model=self._mj_model,
+      model=self._sim.model,
+      data=self._sim.data,
     )
+
+    # Detect ball/sphere joints per entity. Entity does not expose this, so
+    # we walk the compiled model once and cache global qpos/qvel addresses.
     for obj_idx in range(len(self._obj_infos)):
       obj = self._obj_infos[obj_idx]
       entity = self._scene.entities[f"obj{obj_idx}"]
 
-      # Populate basic indexing from Entity
-      obj.body_start = (
-          entity.indexing.body_ids[0]
-          if len(entity.indexing.body_ids) > 0
-          else 0
-      )
-      obj.body_end = (
-          entity.indexing.body_ids[-1] + 1
-          if len(entity.indexing.body_ids) > 0
-          else 0
-      )
-      obj.num_bodies = entity.num_bodies
-      obj.body_names = list(entity.body_names)
-
-      obj.q_dof_start = (
-          entity.indexing.joint_q_adr[0]
-          if len(entity.indexing.joint_q_adr) > 0
-          else 0
-      )
-      obj.q_dof_end = (
-          entity.indexing.joint_q_adr[-1] + 1
-          if len(entity.indexing.joint_q_adr) > 0
-          else 0
-      )
-      obj.v_dof_start = (
-          entity.indexing.joint_v_adr[0]
-          if len(entity.indexing.joint_v_adr) > 0
-          else 0
-      )
-      obj.v_dof_end = (
-          entity.indexing.joint_v_adr[-1] + 1
-          if len(entity.indexing.joint_v_adr) > 0
-          else 0
-      )
-      obj.num_dofs = len(entity.indexing.joint_v_adr)
-
-      obj.ctrl_start = (
-          entity.indexing.ctrl_ids[0]
-          if len(entity.indexing.ctrl_ids) > 0
-          else 0
-      )
-      obj.ctrl_end = (
-          entity.indexing.ctrl_ids[-1] + 1
-          if len(entity.indexing.ctrl_ids) > 0
-          else 0
-      )
-
-      obj.has_free_joint = not entity.is_fixed_base
-      if not entity.is_fixed_base:
-        obj.q_root_start = entity.indexing.free_joint_q_adr[0]
-        obj.v_root_start = entity.indexing.free_joint_v_adr[0]
-
-      # Sphere joint computation
       has_sphere = False
-      sphere_q = []
-      sphere_v = []
-      nonsphere_q = []
-      nonsphere_v = []
-
-      for name in entity.joint_names:
-        jnt = self._mj_model.joint(f"obj{obj_idx}/{name}")
+      sphere_q: list[int] = []
+      sphere_v: list[int] = []
+      nonsphere_q: list[int] = []
+      nonsphere_v: list[int] = []
+      for jname in entity.joint_names:
+        jnt = self._mj_model.joint(f"obj{obj_idx}/{jname}")
         jnt_type = jnt.type[0]
         qadr = jnt.qposadr[0]
         vadr = jnt.dofadr[0]
@@ -362,15 +327,19 @@ class MjlabEngine(engine.Engine):
               kp_arr = kp_arr + [pad_kp] * (num_targets - len(kp_arr))
               kd_arr = kd_arr + [pad_kd] * (num_targets - len(kd_arr))
             kp_t = torch.tensor(
-                [kp_arr], device=self._device, dtype=torch.float32
+              [kp_arr], device=self._device, dtype=torch.float32
             ).expand(self._num_envs, -1)
             kd_t = torch.tensor(
-                [kd_arr], device=self._device, dtype=torch.float32
+              [kd_arr], device=self._device, dtype=torch.float32
             ).expand(self._num_envs, -1)
-            act.set_gains(slice(None), kp=kp_t, kd=kd_t)  # pytype: disable=attribute-error
+            act.set_gains(
+              slice(None), kp=kp_t, kd=kd_t
+            )  # pytype: disable=attribute-error
             logging.info(
-                "Set per-joint PD gains on obj%d: kp=%s, kd=%s",
-                obj_idx, kp_arr, kd_arr,
+              "Set per-joint PD gains on obj%d: kp=%s, kd=%s",
+              obj_idx,
+              kp_arr,
+              kd_arr,
             )
             break
 
@@ -386,17 +355,17 @@ class MjlabEngine(engine.Engine):
       self._build_viewer()
 
     if self.enabled_record_video():
-      self._video_recorder = self._build_video_recorder()
+      # self._video_recorder = self._build_video_recorder()
       self._recording = False
 
     logging.info(
-        "MuJoCo model: nbody={}, njnt={}, nq={}, nv={}, nu={}".format(
-            self._mj_model.nbody,
-            self._mj_model.njnt,
-            self._mj_model.nq,
-            self._mj_model.nv,
-            self._mj_model.nu,
-        )
+      "MuJoCo model: nbody={}, njnt={}, nq={}, nv={}, nu={}".format(
+        self._mj_model.nbody,
+        self._mj_model.njnt,
+        self._mj_model.nq,
+        self._mj_model.nv,
+        self._mj_model.nu,
+      )
     )
 
   def _make_entity_cfg(self, obj_info: ObjInfo) -> EntityCfg:
@@ -405,13 +374,13 @@ class MjlabEngine(engine.Engine):
 
     if "g1.xml" in asset_file:
       joint_pos = {
-          ".*_hip_pitch_joint": -0.1,
-          ".*_knee_joint": 0.3,
-          ".*_ankle_pitch_joint": -0.2,
-          ".*_shoulder_pitch_joint": 0.2,
-          ".*_elbow_joint": 1.28,
-          "left_shoulder_roll_joint": 0.2,
-          "right_shoulder_roll_joint": -0.2,
+        ".*_hip_pitch_joint": -0.1,
+        ".*_knee_joint": 0.3,
+        ".*_ankle_pitch_joint": -0.2,
+        ".*_shoulder_pitch_joint": 0.2,
+        ".*_elbow_joint": 1.28,
+        "left_shoulder_roll_joint": 0.2,
+        "right_shoulder_roll_joint": -0.2,
       }
     else:
       # Default to zero joint positions. Models with keyframes could use None
@@ -423,10 +392,10 @@ class MjlabEngine(engine.Engine):
         spec = mujoco.MjSpec.from_file(f)
         if info.fix_root:
           weld = spec.add_equality(
-              name="weld_pelvis_to_space",
-              type=mujoco.mjtEq.mjEQ_WELD,
-              objtype=mujoco.mjtObj.mjOBJ_BODY,
-              name1="pelvis",
+            name="weld_pelvis_to_space",
+            type=mujoco.mjtEq.mjEQ_WELD,
+            objtype=mujoco.mjtObj.mjOBJ_BODY,
+            name1="pelvis",
           )
           weld.data[:7] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
           logging.info("Added weld constraint for pelvis to fix root.")
@@ -436,12 +405,14 @@ class MjlabEngine(engine.Engine):
             actuator.biasprm[:] = 0.0
         if info.color is not None:
           col_rgba = (
-              np.array([*info.color, 1.0])
-              if len(info.color) == 3
-              else np.array(info.color)
+            np.array([*info.color, 1.0])
+            if len(info.color) == 3
+            else np.array(info.color)
           )
           for geom in spec.geoms:
             geom.rgba = col_rgba
+        # Match newton: do not apply XML stiffness/damping as passive forces.
+        _strip_passive_joint_forces(spec)
         return spec
 
       return spec_fn
@@ -481,23 +452,23 @@ class MjlabEngine(engine.Engine):
       obj_info.per_joint_kp = per_joint_kp
       obj_info.per_joint_kd = per_joint_kd
       print(
-          f"Extracted per-joint gains: kp={per_joint_kp},"
-          f" kd={per_joint_kd}, effort_limit={effort_limit}"
+        f"Extracted per-joint gains: kp={per_joint_kp},"
+        f" kd={per_joint_kd}, effort_limit={effort_limit}"
       )
 
       # Remove the existing actuators — IdealPdActuator will add its own
       # motor actuators
       def make_spec_fn_no_actuators(
-          f: str, info: ObjInfo
+        f: str, info: ObjInfo
       ) -> Callable[[], mujoco.MjSpec]:
         def spec_fn() -> mujoco.MjSpec:
           spec = mujoco.MjSpec.from_file(f)
           if info.fix_root:
             weld = spec.add_equality(
-                name="weld_pelvis_to_space",
-                type=mujoco.mjtEq.mjEQ_WELD,
-                objtype=mujoco.mjtObj.mjOBJ_BODY,
-                name1="pelvis",
+              name="weld_pelvis_to_space",
+              type=mujoco.mjtEq.mjEQ_WELD,
+              objtype=mujoco.mjtObj.mjOBJ_BODY,
+              name1="pelvis",
             )
             weld.active = True
             weld.data[:7] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
@@ -507,43 +478,62 @@ class MjlabEngine(engine.Engine):
             spec.delete(spec.actuators[0])
           if info.color is not None:
             col_rgba = (
-                np.array([*info.color, 1.0])
-                if len(info.color) == 3
-                else np.array(info.color)
+              np.array([*info.color, 1.0])
+              if len(info.color) == 3
+              else np.array(info.color)
             )
             for geom in spec.geoms:
               geom.rgba = col_rgba
+          # Match newton: do not apply XML stiffness/damping as passive forces.
+          # Their values were already captured into per_joint_kp/kd above and
+          # fed into IdealPdActuatorCfg's PD gains.
+          _strip_passive_joint_forces(spec)
           return spec
 
         return spec_fn
 
       articulation = EntityArticulationInfoCfg(
-          actuators=(
-              IdealPdActuatorCfg(
-                  target_names_expr=(".*",),
-                  stiffness=kp,
-                  damping=kd,
-                  effort_limit=effort_limit,
-              ),
+        actuators=(
+          IdealPdActuatorCfg(
+            target_names_expr=(".*",),
+            stiffness=kp,
+            damping=kd,
+            effort_limit=effort_limit,
           ),
+        ),
       )
       return EntityCfg(
-          spec_fn=make_spec_fn_no_actuators(asset_file, obj_info),
-          articulation=articulation,
-          init_state=EntityCfg.InitialStateCfg(
-              pos=obj_info.start_pos,
-              rot=obj_info.start_rot,
-              joint_pos=joint_pos,
-          ),
+        spec_fn=make_spec_fn_no_actuators(asset_file, obj_info),
+        articulation=articulation,
+        init_state=EntityCfg.InitialStateCfg(
+          pos=obj_info.start_pos,
+          rot=obj_info.start_rot,
+          joint_pos=joint_pos,
+        ),
+      )
+
+    # Non-pos modes: keep the XML-declared actuators and wrap them with
+    # XmlActuatorCfg so Entity.indexing.ctrl_ids is populated. Without this,
+    # set_cmd / get_obj_torque_limits / pd_explicit all break in vel /
+    # torque / pd_explicit modes.
+    articulation = None
+    if self._control_mode in (
+      engine.ControlMode.vel,
+      engine.ControlMode.torque,
+      engine.ControlMode.pd_explicit,
+    ):
+      articulation = EntityArticulationInfoCfg(
+        actuators=(XmlActuatorCfg(target_names_expr=(".*",)),),
       )
 
     return EntityCfg(
-        spec_fn=make_spec_fn(asset_file, obj_info),
-        init_state=EntityCfg.InitialStateCfg(
-            pos=obj_info.start_pos,
-            rot=obj_info.start_rot,
-            joint_pos=joint_pos,
-        ),
+      spec_fn=make_spec_fn(asset_file, obj_info),
+      articulation=articulation,
+      init_state=EntityCfg.InitialStateCfg(
+        pos=obj_info.start_pos,
+        rot=obj_info.start_rot,
+        joint_pos=joint_pos,
+      ),
     )
 
   def step(self) -> None:
@@ -558,41 +548,35 @@ class MjlabEngine(engine.Engine):
     """Reset specified environments."""
     self._sim.reset(env_ids)
     self._scene.reset(env_ids)
-    # Re-apply initial transforms for the reset envs
+    # Re-apply initial transforms for the reset envs (combined pose write).
     for obj_idx, obj in enumerate(self._obj_infos):
-      start_pos = torch.tensor(
-          obj.start_pos, device=self._device, dtype=torch.float32
-      )
-      start_rot_xyzw = torch.tensor(
-          obj.start_rot, device=self._device, dtype=torch.float32
-      )
-      self.set_root_pos(env_ids, obj_idx, start_pos)
-      self.set_root_rot(env_ids, obj_idx, start_rot_xyzw)
+      entity = self._entity(obj_idx)
+      if entity.is_fixed_base:
+        continue
+      pose = self._make_pose_tensor(obj, len(env_ids))
+      entity.write_root_link_pose_to_sim(pose, env_ids=env_ids)
     self._scene.write_data_to_sim()
     self._sim.forward()
     self._sim.sense()
 
   def set_cmd(self, obj_id: int, cmd: torch.Tensor) -> None:
-    obj = self._obj_infos[obj_id]
-    ctrl_slice = slice(obj.ctrl_start, obj.ctrl_end)
-
+    entity = self._entity(obj_id)
     if self._control_mode == engine.ControlMode.none:
       pass
     elif self._control_mode == engine.ControlMode.pos:
       # IdealPdActuator: set position target on the entity
-      entity = self._scene.entities[f"obj{obj_id}"]
       entity.set_joint_position_target(cmd)
     elif self._control_mode == engine.ControlMode.vel:
-      self._sim.data.ctrl[:, ctrl_slice] = cmd
+      entity.write_ctrl_to_sim(cmd)
     elif self._control_mode == engine.ControlMode.torque:
-      self._sim.data.ctrl[:, ctrl_slice] = cmd
+      entity.write_ctrl_to_sim(cmd)
     elif self._control_mode == engine.ControlMode.pd_explicit:
       self._pd_targets[obj_id][:] = cmd
     else:
       assert False, "Unsupported control mode: {}".format(self._control_mode)
 
   def set_camera_pose(
-      self, pos: np.ndarray | list[float], look_at: np.ndarray | list[float]
+    self, pos: np.ndarray | list[float], look_at: np.ndarray | list[float]
   ) -> None:
     self._cam_pos = np.array(pos, dtype=np.float64)
     cam_dir = np.array(look_at) - np.array(pos)
@@ -603,16 +587,14 @@ class MjlabEngine(engine.Engine):
 
     if self._viewer is not None:
       self._viewer.cam.lookat[:] = look_at
-      self._viewer.cam.distance = np.linalg.norm(
-          np.array(pos) - np.array(look_at)
-      )
+      self._viewer.cam.distance = np.linalg.norm(np.array(pos) - np.array(look_at))
 
       dx = look_at[0] - pos[0]
       dy = look_at[1] - pos[1]
       dz = look_at[2] - pos[2]
       horiz = np.sqrt(dx * dx + dy * dy)
       self._viewer.cam.elevation = (
-          np.rad2deg(np.arctan2(dz, horiz)) if horiz > 1e-8 else 0
+        np.rad2deg(np.arctan2(dz, horiz)) if horiz > 1e-8 else 0
       )
       self._viewer.cam.azimuth = np.rad2deg(np.arctan2(dy, dx))
 
@@ -646,73 +628,80 @@ class MjlabEngine(engine.Engine):
     return np.array(self._mj_model.opt.gravity)
 
   # ==================== State getters ====================
+  # NOTE: root getters read raw ``qpos``/``qvel`` (the same buffer the
+  # setters write into) rather than the derived ``xpos``/``xquat``/``cvel``
+  # tensors exposed via ``entity.data.root_link_*_w``. ``xpos`` etc. are
+  # only refreshed by ``sim.forward()``, but the env reset path writes
+  # state and then immediately reads it back without forwarding. Reading
+  # raw state matches newton's ``joint_q``/``joint_qd`` semantics and
+  # guarantees set-then-get round-trips at any point in the reset chain.
 
   def get_root_pos(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    if obj.has_free_joint:
-      return self._sim.data.qpos[:, obj.q_root_start : obj.q_root_start + 3]
-    else:
-      return self._sim.data.xpos[:, obj.body_start, :]
+    entity = self._entity(obj_id)
+    if entity.is_fixed_base:
+      return self._sim.data.xpos[:, int(entity.indexing.root_body_id), :]
+    pos_adr = entity.indexing.free_joint_q_adr[0:3]
+    return self._sim.data.qpos[:, pos_adr]
 
   def get_root_rot(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    if obj.has_free_joint:
-      rot_wxyz = self._sim.data.qpos[
-          :, obj.q_root_start + 3 : obj.q_root_start + 7
-      ]
+    """Returns MimicKit (x,y,z,w) quaternion."""
+    entity = self._entity(obj_id)
+    if entity.is_fixed_base:
+      rot_wxyz = self._sim.data.xquat[:, int(entity.indexing.root_body_id), :]
     else:
-      rot_wxyz = self._sim.data.xquat[:, obj.body_start, :]
+      quat_adr = entity.indexing.free_joint_q_adr[3:7]
+      rot_wxyz = self._sim.data.qpos[:, quat_adr]
     return _mj_to_mk_quat(rot_wxyz)
 
   def get_root_vel(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    if obj.has_free_joint:
-      return self._sim.data.qvel[:, obj.v_root_start : obj.v_root_start + 3]
-    else:
-      return self._sim.data.cvel[:, obj.body_start, 3:6]
+    """World-frame linear velocity of the root body."""
+    entity = self._entity(obj_id)
+    if entity.is_fixed_base:
+      # Fixed-base entities have no free-joint qvel; fall back to cvel
+      # (stale until forward()/step() runs, but consistent with original).
+      return self._sim.data.cvel[:, int(entity.indexing.root_body_id), 3:6]
+    lin_adr = entity.indexing.free_joint_v_adr[0:3]
+    return self._sim.data.qvel[:, lin_adr]
 
   def get_root_ang_vel(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    if obj.has_free_joint:
-      ang_vel_body = self._sim.data.qvel[
-          :, obj.v_root_start + 3 : obj.v_root_start + 6
-      ]
-      root_quat_wxyz = self._sim.data.qpos[
-          :, obj.q_root_start + 3 : obj.q_root_start + 7
-      ]
-      return quat_apply(root_quat_wxyz, ang_vel_body)
-    return self._sim.data.cvel[:, obj.body_start, 0:3]
+    """World-frame angular velocity of the root body.
+
+    qvel stores the free-joint angular velocity in *body* frame, so we
+    rotate it to world using the current quat from qpos.
+    """
+    entity = self._entity(obj_id)
+    if entity.is_fixed_base:
+      return self._sim.data.cvel[:, int(entity.indexing.root_body_id), 0:3]
+    v_adr = entity.indexing.free_joint_v_adr
+    q_adr = entity.indexing.free_joint_q_adr
+    ang_b = self._sim.data.qvel[:, v_adr[3:6]]
+    quat_wxyz = self._sim.data.qpos[:, q_adr[3:7]]
+    return quat_apply(quat_wxyz, ang_b)
 
   def get_dof_pos(self, obj_id: int) -> torch.Tensor:
     obj = self._obj_infos[obj_id]
+    entity = self._entity(obj_id)
     if obj.has_sphere_joints:
-      return self._get_dof_pos_expmap(obj)
-    return self._sim.data.qpos[:, obj.q_dof_start : obj.q_dof_end]
+      return self._get_dof_pos_expmap(obj, entity)
+    return entity.data.joint_pos
 
   def get_dof_vel(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    return self._sim.data.qvel[:, obj.v_dof_start : obj.v_dof_end]
+    return self._entity(obj_id).data.joint_vel
 
   def get_dof_forces(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    return self._sim.data.actuator_force[:, obj.ctrl_start : obj.ctrl_end]
+    return self._entity(obj_id).data.actuator_force
 
   def get_body_pos(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    return self._sim.data.xpos[:, obj.body_start : obj.body_end, :]
+    return self._entity(obj_id).data.body_link_pos_w
 
   def get_body_rot(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    rot_wxyz = self._sim.data.xquat[:, obj.body_start : obj.body_end, :]
-    return _mj_to_mk_quat(rot_wxyz)
+    return _mj_to_mk_quat(self._entity(obj_id).data.body_link_quat_w)
 
   def get_body_vel(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    return self._sim.data.cvel[:, obj.body_start : obj.body_end, 3:6]
+    return self._entity(obj_id).data.body_link_lin_vel_w
 
   def get_body_ang_vel(self, obj_id: int) -> torch.Tensor:
-    obj = self._obj_infos[obj_id]
-    return self._sim.data.cvel[:, obj.body_start : obj.body_end, 0:3]
+    return self._entity(obj_id).data.body_link_ang_vel_w
 
   def get_contact_forces(self, obj_id: int) -> torch.Tensor:
     return self._contact_forces[obj_id]
@@ -723,178 +712,226 @@ class MjlabEngine(engine.Engine):
   # ==================== State setters ====================
 
   def set_root_pos(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      root_pos: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    root_pos: torch.Tensor,
   ) -> None:
-    obj = self._obj_infos[obj_id]
-    if obj.has_free_joint:
-      q_start = obj.q_root_start
-      if env_id is None:
-        self._sim.data.qpos[:, q_start : q_start + 3] = root_pos
-      else:
-        self._sim.data.qpos[env_id, q_start : q_start + 3] = root_pos
-    else:
+    entity = self._entity(obj_id)
+    if entity.is_fixed_base:
       logging.warning(
-          "set_root_pos on fixed-root obj %s writes to xpos "
-          "which is overwritten by forward(). Use free joints to move objects.",
-          obj_id,
+        "set_root_pos on fixed-root obj %s writes to xpos "
+        "which is overwritten by forward(). Use free joints to move objects.",
+        obj_id,
       )
+      root_body_id = int(entity.indexing.root_body_id)
       if env_id is None:
-        self._sim.data.xpos[:, obj.body_start, :] = root_pos
+        self._sim.data.xpos[:, root_body_id, :] = root_pos
       else:
-        self._sim.data.xpos[env_id, obj.body_start, :] = root_pos
+        self._sim.data.xpos[env_id, root_body_id, :] = root_pos
+      return
+
+    # Partial write through entity API: read current quat from qpos, combine
+    # with the new position, write the 7-D pose.
+    q_adr = entity.indexing.free_joint_q_adr
+    quat_adr = q_adr[3:7]
+    env_ids_t, n = self._resolve_env_ids_with_count(env_id)
+    pos = self._broadcast_root_field(root_pos, n)
+    cur_quat = self._read_qpos(quat_adr, env_ids_t)
+    pose = torch.cat([pos, cur_quat], dim=-1)
+    entity.write_root_link_pose_to_sim(pose, env_ids=env_ids_t)
 
   def set_root_rot(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      root_rot: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    root_rot: torch.Tensor,
   ) -> None:
     """root_rot in MimicKit convention (x,y,z,w)."""
-    obj = self._obj_infos[obj_id]
+    entity = self._entity(obj_id)
     rot_wxyz = _mk_to_mj_quat(root_rot)
-    if obj.has_free_joint:
-      q_start = obj.q_root_start + 3
-      if env_id is None:
-        self._sim.data.qpos[:, q_start : q_start + 4] = rot_wxyz
-      else:
-        self._sim.data.qpos[env_id, q_start : q_start + 4] = rot_wxyz
-    else:
+    if entity.is_fixed_base:
       logging.warning(
-          "set_root_rot on fixed-root obj %s writes to xquat "
-          "which is overwritten by forward(). Use free joints to move objects.",
-          obj_id,
+        "set_root_rot on fixed-root obj %s writes to xquat "
+        "which is overwritten by forward(). Use free joints to move objects.",
+        obj_id,
       )
+      root_body_id = int(entity.indexing.root_body_id)
       if env_id is None:
-        self._sim.data.xquat[:, obj.body_start, :] = rot_wxyz
+        self._sim.data.xquat[:, root_body_id, :] = rot_wxyz
       else:
-        self._sim.data.xquat[env_id, obj.body_start, :] = rot_wxyz
+        self._sim.data.xquat[env_id, root_body_id, :] = rot_wxyz
+      return
+
+    # Partial write through entity API: read current position from qpos,
+    # combine with the new rotation, write the 7-D pose.
+    q_adr = entity.indexing.free_joint_q_adr
+    pos_adr = q_adr[0:3]
+    env_ids_t, n = self._resolve_env_ids_with_count(env_id)
+    quat = self._broadcast_root_field(rot_wxyz, n)
+    cur_pos = self._read_qpos(pos_adr, env_ids_t)
+    pose = torch.cat([cur_pos, quat], dim=-1)
+    entity.write_root_link_pose_to_sim(pose, env_ids=env_ids_t)
 
   def set_root_vel(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      root_vel: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    root_vel: torch.Tensor | int | float,
   ) -> None:
-    obj = self._obj_infos[obj_id]
-    if obj.has_free_joint:
-      v_start = obj.v_root_start
-      if env_id is None:
-        self._sim.data.qvel[:, v_start : v_start + 3] = root_vel
-      else:
-        self._sim.data.qvel[env_id, v_start : v_start + 3] = root_vel
+    """root_vel is the world-frame linear velocity of the root body."""
+    entity = self._entity(obj_id)
+    if entity.is_fixed_base:
+      return
+
+    # Partial write through entity API: read current world-frame ang_vel,
+    # combine with new lin_vel, write the 6-D velocity.
+    env_ids_t, n = self._resolve_env_ids_with_count(env_id)
+    lin = self._broadcast_root_scalar_or_field(root_vel, n, 3)
+    ang_w = self._read_root_ang_vel_world(entity, env_ids_t)
+    vel = torch.cat([lin, ang_w], dim=-1)
+    entity.write_root_link_velocity_to_sim(vel, env_ids=env_ids_t)
 
   def set_root_ang_vel(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      root_ang_vel: torch.Tensor | int | float,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    root_ang_vel: torch.Tensor | int | float,
   ) -> None:
     """root_ang_vel is in world frame."""
-    obj = self._obj_infos[obj_id]
-    if obj.has_free_joint:
-      v_start = obj.v_root_start + 3
-      if isinstance(root_ang_vel, (int, float)):
-        if env_id is None:
-          self._sim.data.qvel[:, v_start : v_start + 3] = root_ang_vel
-        else:
-          self._sim.data.qvel[env_id, v_start : v_start + 3] = root_ang_vel
-      else:
-        root_quat_wxyz = self._sim.data.qpos[
-            :, obj.q_root_start + 3 : obj.q_root_start + 7
-        ]
-        if env_id is not None:
-          root_quat_wxyz = root_quat_wxyz[env_id]
-        ang_vel_body = quat_apply_inverse(root_quat_wxyz, root_ang_vel)
-        if env_id is None:
-          self._sim.data.qvel[:, v_start : v_start + 3] = ang_vel_body
-        else:
-          self._sim.data.qvel[env_id, v_start : v_start + 3] = ang_vel_body
+    entity = self._entity(obj_id)
+    if entity.is_fixed_base:
+      return
+
+    # Partial write through entity API: read current world-frame lin_vel
+    # straight from qvel (the free joint stores lin in world frame),
+    # combine with new world-frame ang_vel, write the 6-D velocity.
+    # ``write_root_link_velocity_to_sim`` handles the world→body conversion
+    # for the angular part internally.
+    v_adr = entity.indexing.free_joint_v_adr
+    lin_adr = v_adr[0:3]
+    env_ids_t, n = self._resolve_env_ids_with_count(env_id)
+    ang_w = self._broadcast_root_scalar_or_field(root_ang_vel, n, 3)
+    cur_lin = self._read_qvel(lin_adr, env_ids_t)
+    vel = torch.cat([cur_lin, ang_w], dim=-1)
+    entity.write_root_link_velocity_to_sim(vel, env_ids=env_ids_t)
 
   def set_dof_pos(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      dof_pos: torch.Tensor | int | float,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    dof_pos: torch.Tensor | int | float,
   ) -> None:
     obj = self._obj_infos[obj_id]
+    entity = self._entity(obj_id)
     if obj.has_sphere_joints:
-      self._set_dof_pos_with_sphere(env_id, obj, dof_pos)
-    else:
+      self._set_dof_pos_with_sphere(env_id, obj, entity, dof_pos)
+      return
+
+    if isinstance(dof_pos, (int, float)):
+      q_adr = entity.indexing.joint_q_adr
       if env_id is None:
-        self._sim.data.qpos[:, obj.q_dof_start : obj.q_dof_end] = dof_pos
+        self._sim.data.qpos[:, q_adr] = dof_pos
       else:
-        self._sim.data.qpos[env_id, obj.q_dof_start : obj.q_dof_end] = dof_pos
+        env_ids_t = self._as_env_ids_tensor(env_id)
+        self._sim.data.qpos[env_ids_t[:, None], q_adr] = dof_pos
+      return
+
+    env_ids_arg = (
+      env_id
+      if (env_id is None or isinstance(env_id, torch.Tensor))
+      else self._as_env_ids_tensor(env_id)
+    )
+    entity.write_joint_position_to_sim(dof_pos, env_ids=env_ids_arg)
 
   def set_dof_vel(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      dof_vel: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    dof_vel: torch.Tensor,
   ) -> None:
-    obj = self._obj_infos[obj_id]
-    if env_id is None:
-      self._sim.data.qvel[:, obj.v_dof_start : obj.v_dof_end] = dof_vel
-    else:
-      self._sim.data.qvel[env_id, obj.v_dof_start : obj.v_dof_end] = dof_vel
+    entity = self._entity(obj_id)
+    env_ids_arg = (
+      env_id
+      if (env_id is None or isinstance(env_id, torch.Tensor))
+      else self._as_env_ids_tensor(env_id)
+    )
+    entity.write_joint_velocity_to_sim(dof_vel, env_ids=env_ids_arg)
 
   def set_body_vel(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      body_vel: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    body_vel: torch.Tensor,
   ) -> None:
     pass
 
   def set_body_ang_vel(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      body_ang_vel: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    body_ang_vel: torch.Tensor,
   ) -> None:
     pass
 
   def set_body_pos(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      body_pos: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    body_pos: torch.Tensor,
   ) -> None:
-    obj = self._obj_infos[obj_id]
+    entity = self._entity(obj_id)
+    body_ids = entity.indexing.body_ids
     if env_id is None:
-      self._sim.data.xpos[:, obj.body_start : obj.body_end, :] = body_pos
+      self._sim.data.xpos[:, body_ids, :] = body_pos
+    elif isinstance(env_id, torch.Tensor):
+      # Advanced indexing: env_id needs an extra dim to broadcast with body_ids.
+      self._sim.data.xpos[env_id[:, None], body_ids, :] = body_pos
     else:
-      self._sim.data.xpos[env_id, obj.body_start : obj.body_end, :] = body_pos
+      self._sim.data.xpos[env_id, body_ids, :] = body_pos
 
   def set_body_rot(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      body_rot: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    body_rot: torch.Tensor,
   ) -> None:
     """body_rot in MimicKit convention (x,y,z,w)."""
-    obj = self._obj_infos[obj_id]
+    entity = self._entity(obj_id)
     rot_wxyz = _mk_to_mj_quat(body_rot)
+    body_ids = entity.indexing.body_ids
     if env_id is None:
-      self._sim.data.xquat[:, obj.body_start : obj.body_end, :] = rot_wxyz
+      self._sim.data.xquat[:, body_ids, :] = rot_wxyz
+    elif isinstance(env_id, torch.Tensor):
+      self._sim.data.xquat[env_id[:, None], body_ids, :] = rot_wxyz
     else:
-      self._sim.data.xquat[env_id, obj.body_start : obj.body_end, :] = rot_wxyz
+      self._sim.data.xquat[env_id, body_ids, :] = rot_wxyz
 
   def set_body_forces(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj_id: int,
-      body_id: int,
-      forces: torch.Tensor,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj_id: int,
+    body_id: int,
+    forces: torch.Tensor,
   ) -> None:
-    obj = self._obj_infos[obj_id]
-    global_body_id = obj.body_start + body_id
+    entity = self._entity(obj_id)
+    # Normalize forces and env_ids so we can call the entity write API with
+    # consistent shapes (N, num_bodies, 3).
     if env_id is None:
-      self._sim.data.xfrc_applied[:, global_body_id, :3] = forces
+      f = forces.unsqueeze(1)  # (num_envs, 1, 3)
+      env_ids_arg: torch.Tensor | None = None
+    elif isinstance(env_id, torch.Tensor):
+      f = forces.unsqueeze(1)  # (M, 1, 3)
+      env_ids_arg = env_id
     else:
-      self._sim.data.xfrc_applied[env_id, global_body_id, :3] = forces
+      f = forces.view(1, 1, 3)
+      env_ids_arg = self._as_env_ids_tensor(env_id)
+    entity.write_external_wrench_to_sim(
+      forces=f,
+      torques=torch.zeros_like(f),
+      body_ids=[body_id],
+      env_ids=env_ids_arg,
+    )
 
   # ==================== Object info ====================
 
@@ -902,13 +939,13 @@ class MjlabEngine(engine.Engine):
     return self._obj_infos[obj_id].obj_type
 
   def get_obj_num_dofs(self, obj_id: int) -> int:
-    return self._obj_infos[obj_id].num_dofs
+    return int(self._entity(obj_id).indexing.joint_v_adr.numel())
 
   def get_obj_num_bodies(self, obj_id: int) -> int:
-    return self._obj_infos[obj_id].num_bodies
+    return self._entity(obj_id).num_bodies
 
   def get_obj_body_names(self, obj_id: int) -> list[str]:
-    return self._obj_infos[obj_id].body_names
+    return list(self._entity(obj_id).body_names)
 
   def find_obj_body_id(self, obj_id: int, body_name: str) -> int:
     body_names = self.get_obj_body_names(obj_id)
@@ -916,18 +953,16 @@ class MjlabEngine(engine.Engine):
     return body_id
 
   def get_obj_torque_limits(self, env_id: int, obj_id: int) -> np.ndarray:
-    obj = self._obj_infos[obj_id]
-    if obj.ctrl_end > obj.ctrl_start:
-      force_range = self._mj_model.actuator_forcerange[
-          obj.ctrl_start : obj.ctrl_end
-      ]
-      return force_range[:, 1]
-    return np.array([])
+    ctrl_ids = self._entity(obj_id).indexing.ctrl_ids
+    if ctrl_ids.numel() == 0:
+      return np.array([])
+    ids = ctrl_ids.cpu().numpy()
+    return self._mj_model.actuator_forcerange[ids][:, 1]
 
   def get_obj_dof_limits(
-      self, env_id: int, obj_id: int
+    self, env_id: int, obj_id: int
   ) -> tuple[np.ndarray, np.ndarray]:
-    entity = self._scene.entities[f"obj{obj_id}"]
+    entity = self._entity(obj_id)
     dof_low = []
     dof_high = []
     for name in entity.joint_names:
@@ -937,41 +972,23 @@ class MjlabEngine(engine.Engine):
       if jnt_type == mujoco.mjtJoint.mjJNT_BALL:
         lim = self._mj_model.jnt_range[jnt_id]
         for d in range(3):
-          dof_low.append(
-              lim[0] if self._mj_model.jnt_limited[jnt_id] else -np.pi
-          )
-          dof_high.append(
-              lim[1] if self._mj_model.jnt_limited[jnt_id] else np.pi
-          )
+          dof_low.append(lim[0] if self._mj_model.jnt_limited[jnt_id] else -np.pi)
+          dof_high.append(lim[1] if self._mj_model.jnt_limited[jnt_id] else np.pi)
       else:
         lim = self._mj_model.jnt_range[jnt_id]
-        dof_low.append(
-            lim[0] if self._mj_model.jnt_limited[jnt_id] else -2 * np.pi
-        )
-        dof_high.append(
-            lim[1] if self._mj_model.jnt_limited[jnt_id] else 2 * np.pi
-        )
-    return np.array(dof_low, dtype=np.float32), np.array(
-        dof_high, dtype=np.float32
-    )
+        dof_low.append(lim[0] if self._mj_model.jnt_limited[jnt_id] else -2 * np.pi)
+        dof_high.append(lim[1] if self._mj_model.jnt_limited[jnt_id] else 2 * np.pi)
+    return np.array(dof_low, dtype=np.float32), np.array(dof_high, dtype=np.float32)
 
-  def get_obj_pd_gains(
-      self, env_id: int, obj_id: int
-  ) -> tuple[np.ndarray, np.ndarray]:
-    obj = self._obj_infos[obj_id]
-    kp = []
-    kd = []
-    for a_id in range(obj.ctrl_start, obj.ctrl_end):
-      kp.append(self._mj_model.actuator_gainprm[a_id, 0])
-      kd.append(self._mj_model.actuator_biasprm[a_id, 2])
-    kp = np.array(kp, dtype=np.float32)
-    kd = np.abs(np.array(kd, dtype=np.float32))
+  def get_obj_pd_gains(self, env_id: int, obj_id: int) -> tuple[np.ndarray, np.ndarray]:
+    ctrl_ids = self._entity(obj_id).indexing.ctrl_ids.cpu().numpy()
+    kp = self._mj_model.actuator_gainprm[ctrl_ids, 0].astype(np.float32)
+    kd = np.abs(self._mj_model.actuator_biasprm[ctrl_ids, 2]).astype(np.float32)
     return kp, kd
 
   def calc_obj_mass(self, env_id: int, obj_id: int) -> float:
-    obj = self._obj_infos[obj_id]
-    masses = self._mj_model.body_mass[obj.body_start : obj.body_end]
-    return float(np.sum(masses))
+    body_ids = self._entity(obj_id).indexing.body_ids.cpu().numpy()
+    return float(np.sum(self._mj_model.body_mass[body_ids]))
 
   def get_control_mode(self) -> engine.ControlMode:
     return self._control_mode
@@ -986,17 +1003,17 @@ class MjlabEngine(engine.Engine):
     return self._sim.data
 
   def draw_lines(
-      self,
-      env_id: int,
-      start_verts: Any,
-      end_verts: Any,
-      cols: Any,
-      line_width: float,
+    self,
+    env_id: int,
+    start_verts: Any,
+    end_verts: Any,
+    cols: Any,
+    line_width: float,
   ) -> None:
     pass
 
   def register_keyboard_callback(
-      self, key_str: str, callback_func: Callable[..., Any]
+    self, key_str: str, callback_func: Callable[..., Any]
   ) -> None:
     pass
 
@@ -1015,6 +1032,83 @@ class MjlabEngine(engine.Engine):
 
   # ==================== Private methods ====================
 
+  def _entity(self, obj_id: int) -> Entity:
+    return self._scene.entities[f"obj{obj_id}"]
+
+  def _as_env_ids_tensor(self, env_id: int | torch.Tensor) -> torch.Tensor:
+    """Normalize an int/Tensor env id to a 1-D tensor of indices."""
+    if isinstance(env_id, torch.Tensor):
+      return env_id
+    return torch.tensor([env_id], device=self._device, dtype=torch.long)
+
+  def _resolve_env_ids_with_count(
+    self, env_id: int | torch.Tensor | None
+  ) -> tuple[torch.Tensor | None, int]:
+    """Normalize ``env_id`` and report how many envs are addressed."""
+    if env_id is None:
+      return None, self._num_envs
+    env_ids_t = self._as_env_ids_tensor(env_id)
+    return env_ids_t, int(env_ids_t.numel())
+
+  def _broadcast_root_field(self, value: torch.Tensor, n: int) -> torch.Tensor:
+    """Ensure ``value`` has a leading batch dim of ``n``."""
+    if value.dim() == 1:
+      return value.unsqueeze(0).expand(n, -1).contiguous()
+    return value
+
+  def _broadcast_root_scalar_or_field(
+    self, value: torch.Tensor | int | float, n: int, dim: int
+  ) -> torch.Tensor:
+    """Promote a scalar to (n, dim) or normalize a tensor to (n, dim)."""
+    if isinstance(value, (int, float)):
+      return torch.full(
+        (n, dim), float(value), device=self._device, dtype=torch.float32
+      )
+    return self._broadcast_root_field(value, n)
+
+  def _read_qpos(
+    self, adr: torch.Tensor, env_ids_t: torch.Tensor | None
+  ) -> torch.Tensor:
+    """Read a (N, len(adr)) view from ``qpos`` with broadcasted env-id indexing."""
+    if env_ids_t is None:
+      return self._sim.data.qpos[:, adr]
+    return self._sim.data.qpos[env_ids_t[:, None], adr]
+
+  def _read_qvel(
+    self, adr: torch.Tensor, env_ids_t: torch.Tensor | None
+  ) -> torch.Tensor:
+    """Read a (N, len(adr)) view from ``qvel`` with broadcasted env-id indexing."""
+    if env_ids_t is None:
+      return self._sim.data.qvel[:, adr]
+    return self._sim.data.qvel[env_ids_t[:, None], adr]
+
+  def _read_root_ang_vel_world(
+    self, entity: Entity, env_ids_t: torch.Tensor | None
+  ) -> torch.Tensor:
+    """Read body-frame ang_vel from ``qvel`` and rotate to world using ``qpos``.
+
+    Avoids ``entity.data.root_link_ang_vel_w`` (which reads ``cvel``) because
+    ``cvel`` is only refreshed by ``sim.forward()``. During a chain of root
+    setters we want to see the most recent ``qpos``-level writes.
+    """
+    v_adr = entity.indexing.free_joint_v_adr
+    q_adr = entity.indexing.free_joint_q_adr
+    ang_b = self._read_qvel(v_adr[3:6], env_ids_t)
+    quat_w = self._read_qpos(q_adr[3:7], env_ids_t)
+    return quat_apply(quat_w, ang_b)
+
+  def _make_pose_tensor(self, obj: ObjInfo, n: int) -> torch.Tensor:
+    """Build an (N, 7) pose tensor from ``obj.start_pos`` and ``obj.start_rot``.
+
+    Converts the MimicKit (x, y, z, w) start rotation to MuJoCo (w, x, y, z)
+    for ``write_root_link_pose_to_sim``.
+    """
+    pos = torch.tensor(obj.start_pos, device=self._device, dtype=torch.float32)
+    rot_xyzw = torch.tensor(obj.start_rot, device=self._device, dtype=torch.float32)
+    rot_wxyz = _mk_to_mj_quat(rot_xyzw)
+    pose = torch.cat([pos, rot_wxyz], dim=-1)
+    return pose.unsqueeze(0).expand(n, -1).contiguous()
+
   def _visualize(self) -> bool:
     return self._vis
 
@@ -1022,22 +1116,22 @@ class MjlabEngine(engine.Engine):
     num_envs = self.get_num_envs()
     objs_per_env = len(self._env_obj_infos[0])
     for i in range(num_envs):
-      assert (
-          len(self._env_obj_infos[i]) == objs_per_env
-      ), "All envs must have the same number of objects."
+      assert len(self._env_obj_infos[i]) == objs_per_env, (
+        "All envs must have the same number of objects."
+      )
 
   def _build_contact_buffers(self) -> None:
     """Allocate contact force buffers per object."""
     self._contact_forces = []
     self._ground_contact_forces = []
     for obj_idx in range(len(self._obj_infos)):
-      entity = self._scene.entities[f"obj{obj_idx}"]
+      entity = self._entity(obj_idx)
       shape = (self._num_envs, entity.num_bodies, 3)
       self._contact_forces.append(
-          torch.zeros(shape, device=self._device, dtype=torch.float32)
+        torch.zeros(shape, device=self._device, dtype=torch.float32)
       )
       self._ground_contact_forces.append(
-          torch.zeros(shape, device=self._device, dtype=torch.float32)
+        torch.zeros(shape, device=self._device, dtype=torch.float32)
       )
 
   def _update_contact_buffers(self) -> None:
@@ -1048,7 +1142,7 @@ class MjlabEngine(engine.Engine):
 
     cfrc_ext = self._sim.data.cfrc_ext
     for obj_idx in range(len(self._obj_infos)):
-      entity = self._scene.entities[f"obj{obj_idx}"]
+      entity = self._entity(obj_idx)
       obj_cfrc = cfrc_ext[:, entity.indexing.body_ids, :]
       # Forces are in columns 3:6 (linear part)
       self._contact_forces[obj_idx] = obj_cfrc[:, :, 3:6].clone()
@@ -1057,15 +1151,11 @@ class MjlabEngine(engine.Engine):
   def _apply_start_xform(self) -> None:
     """Apply initial positions and rotations to all objects."""
     for obj_idx, obj in enumerate(self._obj_infos):
-      start_pos = torch.tensor(
-          obj.start_pos, device=self._device, dtype=torch.float32
-      )
-      start_rot_xyzw = torch.tensor(
-          obj.start_rot, device=self._device, dtype=torch.float32
-      )
-
-      self.set_root_pos(None, obj_idx, start_pos)
-      self.set_root_rot(None, obj_idx, start_rot_xyzw)
+      entity = self._entity(obj_idx)
+      if entity.is_fixed_base:
+        continue
+      pose = self._make_pose_tensor(obj, self._num_envs)
+      entity.write_root_link_pose_to_sim(pose)
 
     # Run forward to update FK
     self._sim.forward()
@@ -1098,8 +1188,9 @@ class MjlabEngine(engine.Engine):
 
   def _apply_pd_explicit_torque(self) -> None:
     """Compute and apply PD torques for pd_explicit mode."""
-    for obj_idx, obj in enumerate(self._obj_infos):
-      if obj.ctrl_end <= obj.ctrl_start:
+    for obj_idx in range(len(self._obj_infos)):
+      entity = self._entity(obj_idx)
+      if entity.indexing.ctrl_ids.numel() == 0:
         continue
 
       dof_pos = self.get_dof_pos(obj_idx)
@@ -1111,9 +1202,7 @@ class MjlabEngine(engine.Engine):
 
       torque = kp * (target - dof_pos) - kd * dof_vel
       torque = torch.clamp(torque, -torque_lim, torque_lim)
-
-      ctrl_slice = slice(obj.ctrl_start, obj.ctrl_end)
-      self._sim.data.ctrl[:, ctrl_slice] = torque
+      entity.write_ctrl_to_sim(torque)
 
   def _build_controls(self) -> None:
     """Set up control mode buffers for pd_explicit."""
@@ -1122,24 +1211,20 @@ class MjlabEngine(engine.Engine):
       self._pd_kp = []
       self._pd_kd = []
       self._pd_torque_lim = []
-      for obj_idx, obj in enumerate(self._obj_infos):
-        num_ctrl = obj.ctrl_end - obj.ctrl_start
+      for obj_idx in range(len(self._obj_infos)):
+        num_ctrl = int(self._entity(obj_idx).indexing.ctrl_ids.numel())
         target = torch.zeros(
-            self._num_envs, num_ctrl, device=self._device, dtype=torch.float32
+          self._num_envs, num_ctrl, device=self._device, dtype=torch.float32
         )
         self._pd_targets.append(target)
 
         kp, kd = self.get_obj_pd_gains(0, obj_idx)
-        self._pd_kp.append(
-            torch.tensor(kp, device=self._device, dtype=torch.float32)
-        )
-        self._pd_kd.append(
-            torch.tensor(kd, device=self._device, dtype=torch.float32)
-        )
+        self._pd_kp.append(torch.tensor(kp, device=self._device, dtype=torch.float32))
+        self._pd_kd.append(torch.tensor(kd, device=self._device, dtype=torch.float32))
 
         torque_lim = self.get_obj_torque_limits(0, obj_idx)
         self._pd_torque_lim.append(
-            torch.tensor(torque_lim, device=self._device, dtype=torch.float32)
+          torch.tensor(torque_lim, device=self._device, dtype=torch.float32)
         )
 
   def _sync_to_mj_single(self, env_idx: int, mj_data: mujoco.MjData) -> None:
@@ -1154,33 +1239,31 @@ class MjlabEngine(engine.Engine):
     try:
       import mujoco.viewer  # pylint: disable=g-import-not-at-top
 
-      self._viewer = mujoco.viewer.launch_passive(
-          self._mj_model, self._mj_data_display
-      )
+      self._viewer = mujoco.viewer.launch_passive(self._mj_model, self._mj_data_display)
       logging.debug(f"[Debug] Viewer created: {self._viewer}")
     except Exception as e:  # pylint: disable=broad-except
       logging.warning("WARNING: Could not create viewer: {}".format(e))
       self._viewer = None
 
-  def _build_video_recorder(self) -> mjlab_recorder.MjlabVideoRecorder:
-    logging.info("Video recording enabled")
-    return mjlab_recorder.MjlabVideoRecorder(self)
+  # def _build_video_recorder(self) -> mjlab_recorder.MjlabVideoRecorder:
+  #   logging.info("Video recording enabled")
+  #   return mjlab_recorder.MjlabVideoRecorder(self)
 
-  def _get_dof_pos_expmap(self, obj: ObjInfo) -> torch.Tensor:
+  def _get_dof_pos_expmap(self, obj: ObjInfo, entity: Entity) -> torch.Tensor:
     """Convert spherical joint quaternions to exp-map DOF representation."""
     num_envs = self._num_envs
-    expmap = torch.zeros(
-        num_envs, obj.num_dofs, device=self._device, dtype=torch.float32
-    )
+    num_dofs = int(entity.indexing.joint_v_adr.numel())
+    v_dof_start = int(entity.indexing.joint_v_adr[0].item()) if num_dofs > 0 else 0
+    expmap = torch.zeros(num_envs, num_dofs, device=self._device, dtype=torch.float32)
 
     # Copy non-sphere DOFs directly
     for q_idx, v_idx in zip(obj.nonsphere_q_indices, obj.nonsphere_v_indices):
-      local_v = v_idx - obj.v_dof_start
+      local_v = v_idx - v_dof_start
       expmap[:, local_v] = self._sim.data.qpos[:, q_idx]
 
     # Convert sphere joint quaternions to exp-maps
     for q_start, v_start in zip(obj.sphere_q_starts, obj.sphere_v_starts):
-      local_v = v_start - obj.v_dof_start
+      local_v = v_start - v_dof_start
       q_wxyz = self._sim.data.qpos[:, q_start : q_start + 4]
       w = q_wxyz[:, 0:1]
       xyz = q_wxyz[:, 1:4]
@@ -1193,23 +1276,27 @@ class MjlabEngine(engine.Engine):
     return expmap
 
   def _set_dof_pos_with_sphere(
-      self,
-      env_id: int | torch.Tensor | None,
-      obj: ObjInfo,
-      dof_pos: torch.Tensor | int | float,
+    self,
+    env_id: int | torch.Tensor | None,
+    obj: ObjInfo,
+    entity: Entity,
+    dof_pos: torch.Tensor | int | float,
   ) -> None:
     """Set DOF positions when object has spherical joints."""
     qpos = self._sim.data.qpos
+    q_adr = entity.indexing.joint_q_adr
+    v_dof_start = int(entity.indexing.joint_v_adr[0].item())
 
     if isinstance(dof_pos, (int, float)):
       if env_id is None:
-        qpos[:, obj.q_dof_start : obj.q_dof_end] = dof_pos
+        qpos[:, q_adr] = dof_pos
       else:
-        qpos[env_id, obj.q_dof_start : obj.q_dof_end] = dof_pos
+        env_ids_t = self._as_env_ids_tensor(env_id)
+        qpos[env_ids_t[:, None], q_adr] = dof_pos
 
     # Non-sphere DOFs
     for q_idx, v_idx in zip(obj.nonsphere_q_indices, obj.nonsphere_v_indices):
-      local_v = v_idx - obj.v_dof_start
+      local_v = v_idx - v_dof_start
       if env_id is None:
         qpos[:, q_idx] = dof_pos[:, local_v]
       else:
@@ -1217,7 +1304,7 @@ class MjlabEngine(engine.Engine):
 
     # Sphere DOFs: exp-map → quaternion
     for q_start, v_start in zip(obj.sphere_q_starts, obj.sphere_v_starts):
-      local_v = v_start - obj.v_dof_start
+      local_v = v_start - v_dof_start
       if env_id is None:
         exp_map = dof_pos[:, local_v : local_v + 3]
       else:
